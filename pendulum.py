@@ -11,11 +11,12 @@ import matplotlib.pyplot as plt
 # Get absolute path to XML file
 XML_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "pendulum.xml"))
 
-def load_model():
-    if not os.path.exists(XML_PATH):
-        raise FileNotFoundError(f"XML file not found at: {XML_PATH}")
-    
-    return m, d
+FSM_SWINGUP = 0
+FSM_HOLD = 1
+
+def init_controller(m, d):
+    global FSM
+    FSM = FSM_SWINGUP
 
 def controller(m, d):
     
@@ -33,10 +34,26 @@ def controller(m, d):
     d.ctrl[1] = np.pi"""
 
     # torque
-    set_torque_servo(0, 1)
+    #set_torque_servo(0, 1)
     #d.ctrl[0] = -10*(d.qpos[0] - np.pi)
     #d.ctrl[0] = -100*(d.qvel[0] - 0.5)
-    d.ctrl[0] =  -100*(d.qpos[0] - np.pi) -10*(d.qvel[0]) # PD control
+    #d.ctrl[0] =  -100*(d.qpos[0] - np.pi) -10*(d.qvel[0]) # PD control
+
+    global FSM
+
+    if d.qpos[0]>=2.5 and FSM==FSM_SWINGUP:
+        FSM = FSM_HOLD
+
+    if FSM==FSM_SWINGUP:
+        set_velocity_servo(2, 100)
+        d.ctrl[2] = 0.5
+
+    if FSM==FSM_HOLD:
+        set_position_servo(1, 100)
+        set_velocity_servo(2, 10)
+        d.ctrl[1] = np.pi
+
+        
 
 
 def set_torque_servo(actuator_id, flag):
@@ -53,6 +70,7 @@ def set_velocity_servo(actuator_id, kv):
 m = mujoco.MjModel.from_xml_path(XML_PATH)
 d = mujoco.MjData(m)
 
+init_controller(m, d)
 mj.set_mjcb_control(controller)
     
 def main():
@@ -60,7 +78,7 @@ def main():
     print("Launching MuJoCo Interactive Viewer...")
     print(f"Loading model from: {XML_PATH}")
 
-    d.qpos[0] = 1.57
+    d.qpos[0] = 0
 
     with mujoco.viewer.launch_passive(m, d) as viewer:
 
