@@ -1,0 +1,27 @@
+<mujoco>
+  <option gravity="0 0 0"/>
+  
+  <worldbody>
+    <!-- Lighting and Ground -->
+    <light diffuse=".5 .5 .5" pos="0 0 3" dir="0 0 -1"/>
+    <geom type="plane" size="5 5 0.1" rgba=".9 .9 .9 1"/>
+    <camera name="my_cam" pos="0 -10 2" euler="90 0 0"/>
+    
+    <!-- Rocket Model -->
+    <body name="rocket" pos="0 0 3">
+      <joint type="slide" axis="1 0 0"/>
+      <joint type="slide" axis="0 0 1"/>
+      <joint type="hinge" axis="0 -1 0"/>
+      <geom type="cylinder" size="0.1 0.5" rgba="1 0 0 1" mass="1.0"/>
+      <body name="nozzle" pos="0 0 -0.5">
+        <joint name="gimbal" type="hinge" axis="0 -1 0"/>
+        <geom type="cylinder" size="0.08 0.1" pos="0 0 -0.05" rgba="0.3 0.3 0.3 1" mass="0.05"/>
+        <site name="thrust_site" pos="0 0 -0.1"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <position joint="gimbal" kp="50"/>
+    <motor site="thrust_site" gear="0 0 1 0 0 0"/>
+  </actuator>
+</mujoco>

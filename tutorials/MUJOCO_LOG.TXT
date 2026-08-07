@@ -1,0 +1,4 @@
+ERROR mjv_cameraFrustum (engine_vis_visualize.c:527) Wed Aug  5 17:38:21 2026: fixed camera id is outside valid range
+
+ERROR mjv_cameraFrustum (engine_vis_visualize.c:527) Wed Aug  5 17:38:55 2026: fixed camera id is outside valid range
+

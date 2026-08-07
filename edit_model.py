@@ -3,7 +3,7 @@ import mujoco as mj
 import mujoco.viewer
 
 # Get absolute path to XML file
-XML_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "ball.xml"))
+XML_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "2D_rocket.xml"))
 
 def load_model():
     if not os.path.exists(XML_PATH):
