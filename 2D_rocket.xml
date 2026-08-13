@@ -1,5 +1,6 @@
 <mujoco>
-  <option gravity="0 0 0"/>
+  <option gravity="0 0 -9.81"/>
+  <option density="1.225" viscosity="0.00002" wind="0 0 0"/>
   
   <worldbody>
     <!-- Lighting and Ground -->
