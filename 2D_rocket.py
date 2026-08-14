@@ -9,6 +9,7 @@ from scipy.spatial.transform import Rotation as R
 
 from sensor import Accelerometer, Gyroscope, GPS
 from multiplicative_ekf import MEKF
+from control import MPCController
 
 # Get absolute path to XML file
 XML_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "2D_rocket.xml"))
@@ -30,12 +31,35 @@ def load_model():
     
     return m, d
 
+mpc = None
+x_target = None
+last_mpc_time = -1.0
+current_thrust = 0.0
+current_gimbal = 0.0
+
+def init_controller(m, d):
+    global mpc, x_target, current_thrust
+    mpc = MPCController(N=20, dt=0.1)
+    x_target = [5.0, 10.0, 0.0, 0.0, 0.0, 0.0]
+    # rough hover thrust guess
+    current_thrust = m.opt.gravity[2] * -1.05
+
 def controller(m, d):
-    set_position_servo(0, 100)
-    set_torque_servo(1, 1)
+    global last_mpc_time, current_thrust, current_gimbal
     
-    d.ctrl[0] = 0
-    d.ctrl[1] = 10
+    # Run MPC at 10Hz
+    if d.time - last_mpc_time >= 0.1:
+        x_current = [
+            d.qpos[0], d.qpos[1], 
+            d.qvel[0], d.qvel[1], 
+            d.qpos[2], d.qvel[2]
+        ]
+        
+        current_thrust, current_gimbal = mpc.solve(x_current, x_target)
+        last_mpc_time = d.time
+        
+    d.ctrl[0] = current_gimbal
+    d.ctrl[1] = current_thrust
 
 def wind_field(model, data):
     pass
@@ -63,11 +87,12 @@ def main():
     print("Launching MuJoCo Interactive Viewer...")
     print(f"Loading model from: {XML_PATH}")
 
+    init_controller(m, d)
     mj.set_mjcb_control(controller)
     #mj.set_mjcb_passive(wind_field)
 
-    accel = Accelerometer(3, 0.025, 0.005)
-    gyro = Gyroscope(3, 0.005, 0.001)
+    accel = Accelerometer(3, 0.005, 0.001)
+    gyro = Gyroscope(3, 0.005, 0.002)
     gps = GPS(3, 0.001)
 
     mj.mj_forward(m, d)

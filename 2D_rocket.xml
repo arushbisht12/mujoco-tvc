@@ -26,7 +26,7 @@
     <gyro site="body" name="body_gyro"/>
   </sensor>
   <actuator>
-    <position joint="gimbal" kp="50"/>
-    <motor site="thrust_site" gear="0 0 1 0 0 0"/>
+    <position joint="gimbal" kp="50" ctrlrange="-0.26 0.26" ctrllimited="true"/>
+    <motor site="thrust_site" gear="0 0 1 0 0 0" forcerange="0 20" forcelimited="true"/>
   </actuator>
 </mujoco>

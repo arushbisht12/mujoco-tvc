@@ -91,7 +91,8 @@ class MEKF:
         
         # Fold error state back into nominal states
         small_angle_approx_q = np.concatenate(([1.0], 0.5 * error_state[0:3].ravel())).reshape(-1,1)
-        self._x[0:4] = quat_multiply(self.q, small_angle_approx_q)
+        new_q = quat_multiply(self.q, small_angle_approx_q)
+        self._x[0:4] = new_q / np.linalg.norm(new_q)
         self._x[4:7] = self.vel.reshape(-1,1) + error_state[3:6]
         self._x[7:10] = self.pos.reshape(-1,1) + error_state[6:9]
         self._x[10:13] += error_state[9:12]
@@ -106,6 +107,7 @@ class MEKF:
         pos_prev = self._x[7:10]
         
         q_new = (np.eye(4) + 0.5 * dt * self.omega(gyr)).dot(q_prev) # switch to @
+        q_new = q_new / np.linalg.norm(q_new) # normalize to prevent drift
         #use q_old or q_new?
         vel_new = vel_prev + self.rotation_body_to_earth(q_new).dot(acc) * dt # switch to @
         vel_new[2] -= self.g_const * dt # to account for graivty acceleration

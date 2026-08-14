@@ -1,177 +1,120 @@
 import casadi as ca
 import numpy as np
-import matplotlib.pyplot as plt
 
-# 1. System Parameters
-m = 1.05       # mass (kg)
-g = 9.81       # gravity (m/s^2)
-J = 0.0875     # moment of inertia (kg*m^2), estimated as 1/12 * m * L^2
-L_cg = 0.5     # distance from CoM to gimbal (m)
-
-# 2. Optimization Parameters
-N = 50         # horizon
-dt = 0.1       # timestep
-
-# 3. Cost matrices
-Q = np.diag([10.0, 10.0, 1.0, 1.0, 10.0, 1.0]) # State cost
-R = np.diag([0.1, 10.0])                       # Control cost
-S = np.diag([0.1, 10.0])                       # Control rate cost
-
-def setup_casadi_opti():
-    # 4. Dynamics Definition
-    # States: px, pz, vx, vz, theta, omega
-    x = ca.MX.sym('x', 6)
-    px, pz, vx, vz, theta, omega = x[0], x[1], x[2], x[3], x[4], x[5]
-
-    # Controls: F, delta
-    u = ca.MX.sym('u', 2)
-    F, delta = u[0], u[1]
-
-    # Continuous dynamics
-    px_dot = vx
-    pz_dot = vz
-    vx_dot = -F/m * ca.sin(theta + delta)
-    vz_dot = F/m * ca.cos(theta + delta) - g
-    theta_dot = omega
-    omega_dot = -F/J * ca.sin(delta) * L_cg
-
-    x_dot = ca.vertcat(px_dot, pz_dot, vx_dot, vz_dot, theta_dot, omega_dot)
-
-    # Continuous function
-    f_cont = ca.Function('f_cont', [x, u], [x_dot])
-
-    # RK4 Discretization
-    k1 = f_cont(x, u)
-    k2 = f_cont(x + dt/2 * k1, u)
-    k3 = f_cont(x + dt/2 * k2, u)
-    k4 = f_cont(x + dt * k3, u)
-    x_next = x + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
-
-    f_discrete = ca.Function('f_discrete', [x, u], [x_next])
-
-    # 5. Opti Formulation
-    opti = ca.Opti()
-
-    X = opti.variable(6, N+1)
-    U = opti.variable(2, N)
-
-    # Target references
-    x_start = [0.0, 5.0, 0.0, 0.0, 0.0, 0.0]  # Start at [0, 5]
-    x_end = [5.0, 10.0, 0.0, 0.0, 0.0, 0.0]   # End at [5, 10]
-    x_ref = np.array(x_end).reshape(-1, 1)
-
-    # Cost function
-    cost = 0
-
-    for k in range(N):
-        # Dynamics constraint
-        opti.subject_to(X[:, k+1] == f_discrete(X[:, k], U[:, k]))
+class MPCController:
+    def __init__(self, N=20, dt=0.1):
+        self.N = N
+        self.dt = dt
         
-        # State constraints
-        opti.subject_to(X[1, k] >= 0.0)  # pz >= 0
+        # parameters
+        m = 1.05       # mass (kg)
+        g = 9.81       # gravity (m/s^2)
+        J = 0.0875     # moment of inertia (kg*m^2)
+        L_cg = 0.5     # distance from CoM to gimbal (m)
         
-        # Control constraints
-        opti.subject_to(opti.bounded(0.0, U[0, k], 20.0))    # Thrust limits
-        opti.subject_to(opti.bounded(-0.26, U[1, k], 0.26))  # Gimbal limits
+        # objective
+        Q = np.diag([10.0, 10.0, 1.0, 1.0, 10.0, 1.0]) # state 
+        R = np.diag([0.1, 10.0])                       # control 
+        S = np.diag([0.1 *100, 10.0 *10])              # control rate
+        Q_terminal = Q * 10.0 *100                     # heavy terminal cost
         
-        # Running cost
-        err = X[:, k] - x_ref
-        cost += ca.mtimes([err.T, Q, err])
-        cost += ca.mtimes([U[:, k].T, R, U[:, k]])
+        # state: px, pz, vx, vz, theta, omega
+        x = ca.MX.sym('x', 6)
+        px, pz, vx, vz, theta, omega = x[0], x[1], x[2], x[3], x[4], x[5]
         
-        if k > 0:
-            du = U[:, k] - U[:, k-1]
-            cost += ca.mtimes([du.T, S, du])
+        # control u: F, delta
+        u = ca.MX.sym('u', 2)
+        F, delta = u[0], u[1]
+        
+        # continuous dynamics
+        px_dot = vx
+        pz_dot = vz
+        vx_dot = -F/m * ca.sin(theta + delta)
+        vz_dot = F/m * ca.cos(theta + delta) - g
+        theta_dot = omega
+        omega_dot = -F/J * ca.sin(delta) * L_cg
+        
+        x_dot = ca.vertcat(px_dot, pz_dot, vx_dot, vz_dot, theta_dot, omega_dot)
+        
+        # state transition function
+        f_cont = ca.Function('f_cont', [x, u], [x_dot])
+        
+        # RK4 discretization
+        k1 = f_cont(x, u)
+        k2 = f_cont(x + dt/2 * k1, u)
+        k3 = f_cont(x + dt/2 * k2, u)
+        k4 = f_cont(x + dt * k3, u)
+        x_next = x + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+        
+        f_discrete = ca.Function('f_discrete', [x, u], [x_next])
+        
+        # problem formulation
+        self.opti = ca.Opti()
+        
+        self.X = self.opti.variable(6, N+1)
+        self.U = self.opti.variable(2, N)
+        
+        self.x_init = self.opti.parameter(6)
+        self.x_ref = self.opti.parameter(6)
+        
+        cost = 0
+        for k in range(N):
+            # dynamics constraints
+            self.opti.subject_to(self.X[:, k+1] == f_discrete(self.X[:, k], self.U[:, k]))
+            
+            # state constraints
+            self.opti.subject_to(self.X[1, k] >= 0.0)  # pz >= 0
+            
+            # control constraints
+            self.opti.subject_to(self.opti.bounded(0.0, self.U[0, k], 20.0))    # Thrust limits
+            self.opti.subject_to(self.opti.bounded(-0.26, self.U[1, k], 0.26))  # Gimbal limits
+            
+            # objective function
+            err = self.X[:, k] - self.x_ref
+            cost += ca.mtimes([err.T, Q, err])
+            cost += ca.mtimes([self.U[:, k].T, R, self.U[:, k]])
+            
+            # soft constraint for angle limits to prevent infeasibility
+            """angle = self.X[4, k]
+            angle_limit = np.pi/4
+            slack = ca.fmax(0, ca.fabs(angle) - angle_limit)
+            cost += 10000.0 * slack**2"""
+            
+            if k > 0:
+                du = self.U[:, k] - self.U[:, k-1]
+                cost += ca.mtimes([du.T, S, du])
+                
+        # terminal cost (soft constraint for end state)
+        err_N = self.X[:, N] - self.x_ref
+        cost += ca.mtimes([err_N.T, Q_terminal, err_N])
+        
+        # boundary conditions
+        self.opti.subject_to(self.X[:, 0] == self.x_init)
+        
+        self.opti.minimize(cost)
+        
+        # solver options
+        p_opts = {"expand": True}
+        s_opts = {"max_iter": 100, "print_level": 0, "sb": "yes"}
+        self.opti.solver("ipopt", p_opts, s_opts)
 
-    # Boundary conditions
-    opti.subject_to(X[:, 0] == x_start)
-    opti.subject_to(X[:, N] == x_ref)
+        # State for warm starting
+        self.U_prev = np.zeros((2, N))
+        self.U_prev[0, :] = m * g # initial guess hover thrust
 
-    # Initial guess to help solver
-    for k in range(N):
-        opti.set_initial(U[0, k], m*g) # hover thrust
-        opti.set_initial(X[1, k], np.linspace(x_start[1], x_end[1], N+1)[k])
-        opti.set_initial(X[0, k], np.linspace(x_start[0], x_end[0], N+1)[k])
-
-    opti.minimize(cost)
-
-    # Solver options
-    p_opts = {"expand": True}
-    s_opts = {"max_iter": 500, "print_level": 5}
-    opti.solver("ipopt", p_opts, s_opts)
-
-    return opti, X, U, N, dt, x_start, x_end
-
-def main():
-    opti, X, U, N, dt, x_start, x_end = setup_casadi_opti()
-
-    print("Solving CasADi optimization...")
-    try:
-        sol = opti.solve()
+    def solve(self, x_current, x_target):
+        self.opti.set_value(self.x_init, x_current)
+        self.opti.set_value(self.x_ref, x_target)
         
-        X_res = sol.value(X)
-        U_res = sol.value(U)
+        # warm start
+        self.opti.set_initial(self.U, self.U_prev)
         
-        # 6. Plotting
-        time = np.linspace(0, N*dt, N+1)
-        
-        plt.figure(figsize=(12, 10))
-        
-        # Trajectory
-        plt.subplot(3, 2, 1)
-        plt.plot(X_res[0, :], X_res[1, :], 'b-o', markersize=3)
-        plt.plot(x_start[0], x_start[1], 'go', label='Start')
-        plt.plot(x_end[0], x_end[1], 'ro', label='End')
-        plt.xlabel('px (m)')
-        plt.ylabel('pz (m)')
-        plt.title('Trajectory in XZ plane')
-        plt.legend()
-        plt.grid(True)
-        
-        # Thrust
-        plt.subplot(3, 2, 2)
-        plt.plot(time[:-1], U_res[0, :], 'r-', drawstyle='steps-post')
-        plt.axhline(20.0, color='k', linestyle='--')
-        plt.axhline(0.0, color='k', linestyle='--')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Thrust (N)')
-        plt.title('Thrust Command')
-        plt.grid(True)
-        
-        # Gimbal
-        plt.subplot(3, 2, 3)
-        plt.plot(time[:-1], U_res[1, :], 'g-', drawstyle='steps-post')
-        plt.axhline(0.26, color='k', linestyle='--')
-        plt.axhline(-0.26, color='k', linestyle='--')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Gimbal Angle (rad)')
-        plt.title('Gimbal Angle Command')
-        plt.grid(True)
-        
-        # Theta
-        plt.subplot(3, 2, 4)
-        plt.plot(time, X_res[4, :], 'm-')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Pitch Angle (rad)')
-        plt.title('Pitch Angle over Time')
-        plt.grid(True)
-        
-        # Velocities
-        plt.subplot(3, 2, 5)
-        plt.plot(time, X_res[2, :], label='vx')
-        plt.plot(time, X_res[3, :], label='vz')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Velocity (m/s)')
-        plt.title('Velocities')
-        plt.legend()
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig('trajectory.png')
-        print("Trajectory plotted and saved to trajectory.png")
-        
-    except Exception as e:
-        print(f"Optimization failed: {e}")
-
-if __name__ == "__main__":
-    main()
+        try:
+            sol = self.opti.solve()
+            U_res = sol.value(self.U)
+            self.U_prev = U_res
+            return U_res[0, 0], U_res[1, 0] # Return F and delta for timestep 0
+        except Exception as e:
+            # If optimization fails, reuse the previous initial command
+            print("MPC Failed, using previous command")
+            return self.U_prev[0, 0], self.U_prev[1, 0]
