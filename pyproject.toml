@@ -10,6 +10,7 @@ dependencies = [
     "matplotlib>=3.11.1",
     "mujoco>=3.10.0",
     "numpy>=2.5.1",
+    "pyquaternion>=0.9.9",
     "rerun-sdk>=0.36.0",
     "scipy>=1.18.0",
 ]

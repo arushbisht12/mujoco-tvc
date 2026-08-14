@@ -14,6 +14,7 @@
       <joint type="slide" axis="0 0 1"/>
       <joint type="hinge" axis="0 -1 0"/>
       <geom type="cylinder" size="0.1 0.5" rgba="1 0 0 1" mass="1.0"/>
+      <site name="body" pos="0 0 0"/>
       <body name="nozzle" pos="0 0 -0.5">
         <joint name="gimbal" type="hinge" axis="0 -1 0"/>
         <geom type="cylinder" size="0.08 0.1" pos="0 0 -0.05" rgba="0.3 0.3 0.3 1" mass="0.05"/>
@@ -21,6 +22,9 @@
       </body>
     </body>
   </worldbody>
+  <sensor>
+    <gyro site="body" name="body_gyro"/>
+  </sensor>
   <actuator>
     <position joint="gimbal" kp="50"/>
     <motor site="thrust_site" gear="0 0 1 0 0 0"/>

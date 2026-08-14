@@ -33,7 +33,7 @@ class Gyroscope:
         :param true_angular_velocity: (3,) numpy array of true angular velocity in body frame.
         :return: (3,) numpy array of noisy angular velocity measurement in body frame.
         """
-        assert len(true_angular_velocity) == self.n
+        assert true_angular_velocity.shape[0] == self.n
 
         white_noise = np.random.normal(0, self.sigma, size=self.n)
         bias_drift = np.random.normal(0, np.sqrt(self.random_walk*dt), size=self.n)
@@ -64,8 +64,9 @@ class Magnetometer:
         return true_magnetic_field + noise
     
 class GPS:
-    def __init__(self):
-        self.sigma = 0
+    def __init__(self, n, sigma):
+        self.n = n
+        self.sigma = sigma
 
     def sample(self, true_position: np.ndarray) -> np.ndarray:
         """
@@ -73,6 +74,8 @@ class GPS:
         :param true_position: (3,) numpy array of true position in world frame.
         :return: (3,) numpy array of noisy position measurement in world frame.
         """
+        assert true_position.shape[0] == self.n
+
         noise = np.random.normal(0, self.sigma, size=true_position.shape)
         return true_position + noise
     
