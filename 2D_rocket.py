@@ -11,7 +11,6 @@ from sensor import Accelerometer, Gyroscope, GPS
 from multiplicative_ekf import MEKF
 from control import MPCController
 
-# Get absolute path to XML file
 XML_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "2D_rocket.xml"))
 
 rr.init("mujoco_telemetry", spawn=True)
@@ -39,7 +38,7 @@ current_gimbal = 0.0
 
 def init_controller(m, d):
     global mpc, x_target, current_thrust
-    mpc = MPCController(N=20, dt=0.1)
+    mpc = MPCController(N=20, dt=0.1, alpha=1.08, beta=0.11, gamma=45.50)
     x_target = [5.0, 10.0, 0.0, 0.0, 0.0, 0.0]
     # rough hover thrust guess
     current_thrust = m.opt.gravity[2] * -1.05

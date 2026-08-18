@@ -2,7 +2,7 @@ import casadi as ca
 import numpy as np
 
 class MPCController:
-    def __init__(self, N=20, dt=0.1):
+    def __init__(self, N=20, dt=0.1, alpha=1.0, beta=1.0, gamma=1.0):
         self.N = N
         self.dt = dt
         
@@ -13,9 +13,14 @@ class MPCController:
         L_cg = 0.5     # distance from CoM to gimbal (m)
         
         # objective
-        Q = np.diag([10.0, 10.0, 1.0, 1.0, 10.0, 1.0]) # state 
-        R = np.diag([0.1, 10.0])                       # control 
-        S = np.diag([0.1 *100, 10.0 *10])              # control rate
+        Q_base = np.diag([10.0, 10.0, 1.0, 1.0, 10.0, 1.0]) # state 
+        R_base = np.diag([0.1, 10.0])                       # control 
+        S_base = np.diag([0.1 *100, 10.0 *10])              # control rate
+        
+        # BO weights
+        Q = alpha * Q_base
+        R = beta * R_base
+        S = gamma * S_base
         Q_terminal = Q * 10.0 *100                     # heavy terminal cost
         
         # state: px, pz, vx, vz, theta, omega
@@ -94,7 +99,7 @@ class MPCController:
         self.opti.minimize(cost)
         
         # solver options
-        p_opts = {"expand": True}
+        p_opts = {"expand": True, "print_time": False}
         s_opts = {"max_iter": 100, "print_level": 0, "sb": "yes"}
         self.opti.solver("ipopt", p_opts, s_opts)
 
