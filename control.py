@@ -68,7 +68,7 @@ class MPCController:
             self.opti.subject_to(self.X[:, k+1] == f_discrete(self.X[:, k], self.U[:, k]))
             
             # state constraints
-            self.opti.subject_to(self.X[1, k] >= 0.0)  # pz >= 0
+            self.opti.subject_to(self.X[1, k+1] >= 0.0)  # pz >= 0 for predicted steps
             
             # control constraints
             self.opti.subject_to(self.opti.bounded(0.0, self.U[0, k], 20.0))    # Thrust limits

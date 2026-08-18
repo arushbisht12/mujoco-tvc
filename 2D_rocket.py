@@ -35,24 +35,39 @@ x_target = None
 last_mpc_time = -1.0
 current_thrust = 0.0
 current_gimbal = 0.0
+mekf = None
+latest_sensor_gyro = None
 
 def init_controller(m, d):
     global mpc, x_target, current_thrust
-    mpc = MPCController(N=20, dt=0.1, alpha=1.08, beta=0.11, gamma=45.50)
+    mpc = MPCController(N=20, dt=0.1, alpha=0.026, beta=0.019, gamma=0.881)
     x_target = [5.0, 10.0, 0.0, 0.0, 0.0, 0.0]
     # rough hover thrust guess
     current_thrust = m.opt.gravity[2] * -1.05
 
 def controller(m, d):
-    global last_mpc_time, current_thrust, current_gimbal
+    global last_mpc_time, current_thrust, current_gimbal, mekf, latest_sensor_gyro
     
-    # Run MPC at 10Hz
+    # 10 Hz mpc
     if d.time - last_mpc_time >= 0.1:
-        x_current = [
-            d.qpos[0], d.qpos[1], 
-            d.qvel[0], d.qvel[1], 
-            d.qpos[2], d.qvel[2]
-        ]
+        if mekf is not None:
+            px = mekf.pos[0]
+            pz = mekf.pos[2]
+            vx = mekf.vel[0]
+            vz = mekf.vel[2]
+            theta = -mekf.mean[1]  # phi angle = -pitch_euler
+            if latest_sensor_gyro is not None:
+                omega = -(latest_sensor_gyro[1] - mekf.gyr_b[1])
+            else:
+                omega = d.qvel[2]
+            
+            x_current = [px, pz, vx, vz, theta, omega]
+        else:
+            x_current = [
+                d.qpos[0], d.qpos[1], 
+                d.qvel[0], d.qvel[1], 
+                d.qpos[2], d.qvel[2]
+            ]
         
         current_thrust, current_gimbal = mpc.solve(x_current, x_target)
         last_mpc_time = d.time
@@ -76,6 +91,8 @@ def quat_to_euler(q):
     return euler_angles
 
 def main():
+    global mekf, latest_sensor_gyro
+
     camera_name = "my_cam"
     camera_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
 
@@ -140,8 +157,9 @@ def main():
             # print("phi: ", d.qpos[2])
 
             # sensor sampling
-            sensor_acc = accel.sample(np.array([d.qacc[0], 0, d.qacc[1]]), physics_dt)
-            sensor_gyro = gyro.sample(d.sensordata[:3], physics_dt)
+            sensor_acc = accel.sample(d.sensordata[:3], physics_dt)
+            sensor_gyro = gyro.sample(d.sensordata[3:6], physics_dt)
+            latest_sensor_gyro = sensor_gyro
 
             # mekf update
             mekf.prediction(physics_dt, sensor_gyro.reshape(3, 1), sensor_acc.reshape(3, 1))
@@ -152,7 +170,7 @@ def main():
 
             if steps_to_gps >= steps_per_gps:
                 gps_pos = gps.sample(np.array([d.qpos[0], 0, d.qpos[1]]).reshape(3, 1))
-                mekf.correction(physics_dt * steps_to_gps, gps=gps_pos)
+                mekf.correction(physics_dt * steps_to_gps, acc=sensor_acc.reshape(3,1), mag=None, gps=gps_pos) # TODO make mekf auto reshapes sensor data
                 steps_to_gps = 0
 
             if steps_to_render >= steps_per_render:
@@ -167,7 +185,7 @@ def main():
                 # log mekf states
                 rr.log("mekf/mean/x", rr.Scalars(mekf.mean[6]))
                 rr.log("mekf/mean/z", rr.Scalars(mekf.mean[8]))
-                rr.log("mekf/mean/phi", rr.Scalars(mekf.mean[1]))
+                rr.log("mekf/mean/phi", rr.Scalars(-mekf.mean[1]))
                 rr.log("mekf/mean/vx", rr.Scalars(mekf.mean[3]))
                 rr.log("mekf/mean/vz", rr.Scalars(mekf.mean[5]))
 
