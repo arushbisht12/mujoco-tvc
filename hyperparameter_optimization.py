@@ -9,12 +9,11 @@ from control import MPCController
 
 XML_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "2D_rocket.xml"))
 
-def run_simulation(trial, alpha, beta, gamma, sim_time=10.0):
+def run_simulation(trial, alpha, beta, gamma, x_target, scenario_idx=0, cost_offset=0.0, sim_time=10.0):
     m = mujoco.MjModel.from_xml_path(XML_PATH)
     d = mujoco.MjData(m)
     
     mpc = MPCController(N=20, dt=0.1, alpha=alpha, beta=beta, gamma=gamma)
-    x_target = np.array([5.0, 10.0, 0.0, 0.0, 0.0, 0.0])
     
     physics_dt = m.opt.timestep   # 0.001s (1000Hz)
     mpc_dt = 0.1                  # 0.1s (10Hz)
@@ -24,12 +23,13 @@ def run_simulation(trial, alpha, beta, gamma, sim_time=10.0):
     total_mpc_steps = int(round(sim_time / mpc_dt))
     total_physics_steps = int(round(sim_time / physics_dt))
     
-    # 70% steady-state threshold (fixed based on total planned simulation horizon)
+    # 70% steady-state threshold
     N_ss = int(0.7 * total_mpc_steps)
     delta_max = 0.26
     
     current_thrust = 1.05 * 9.81  # hover thrust guess
-    current_gimbal = 0.0
+    current_gimbal_x = 0.0
+    current_gimbal_y = 0.0
     
     # Sensors and MEKF setup
     accel = Accelerometer(3, 0.005, 0.001)
@@ -38,15 +38,9 @@ def run_simulation(trial, alpha, beta, gamma, sim_time=10.0):
     
     mujoco.mj_forward(m, d)
     
-    x0, z0, phi0, gimbal0 = d.qpos
-    vx0, vz0, vphi0, vgimbal0 = d.qvel
-    
-    p0 = np.array([x0, 0, z0]).reshape(-1, 1)
-    v0 = np.array([vx0, 0, vz0]).reshape(-1, 1)
-    
-    r = R.from_rotvec(np.array([0, -phi0, 0]))
-    q0_scipy = r.as_quat()
-    q0 = np.array([q0_scipy[3], q0_scipy[0], q0_scipy[1], q0_scipy[2]]).reshape(-1, 1)
+    p0 = np.array(d.qpos[0:3]).reshape(3, 1)
+    v0 = np.array(d.qvel[0:3]).reshape(3, 1)
+    q0 = np.array(d.qpos[3:7]).reshape(4, 1)
     
     gyro_cov = 0.05
     accel_cov = 0.1
@@ -66,7 +60,7 @@ def run_simulation(trial, alpha, beta, gamma, sim_time=10.0):
     cumulative_cost = 0.0
     mpc_step_idx = 0
     steps_to_gps = 0
-    
+
     for step in range(total_physics_steps):
         # Sensor sampling
         sensor_acc = accel.sample(d.sensordata[:3], physics_dt)
@@ -77,55 +71,56 @@ def run_simulation(trial, alpha, beta, gamma, sim_time=10.0):
         
         steps_to_gps += 1
         if steps_to_gps >= steps_per_gps:
-            gps_pos = gps.sample(np.array([d.qpos[0], 0, d.qpos[1]]).reshape(3, 1))
+            gps_pos = gps.sample(np.array(d.qpos[0:3]).reshape(3, 1))
             mekf.correction(physics_dt * steps_to_gps, acc=sensor_acc.reshape(3, 1), mag=None, gps=gps_pos)
             steps_to_gps = 0
         
         if step % steps_per_mpc == 0:
-            px = mekf.pos[0]
-            pz = mekf.pos[2]
-            vx = mekf.vel[0]
-            vz = mekf.vel[2]
-            theta = -mekf.mean[1]
-            omega = -(sensor_gyro[1] - mekf.gyr_b[1])
+            px, py, pz = mekf.pos[0], mekf.pos[1], mekf.pos[2]
+            vx, vy, vz = mekf.vel[0], mekf.vel[1], mekf.vel[2]
+            qw, qx, qy, qz = mekf.q[0], mekf.q[1], mekf.q[2], mekf.q[3]
+            wx = sensor_gyro[0] - mekf.gyr_b[0]
+            wy = sensor_gyro[1] - mekf.gyr_b[1]
+            wz = sensor_gyro[2] - mekf.gyr_b[2]
             
-            x_current = np.array([px, pz, vx, vz, theta, omega])
+            x_current = [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz]
             
-            thrust_cmd, gimbal_cmd = mpc.solve(x_current, x_target)
-            current_thrust = thrust_cmd
-            current_gimbal = gimbal_cmd
+            current_thrust, current_gimbal_x, current_gimbal_y = mpc.solve(x_current, x_target)
             
             # --- Incremental Partial Fitness (ITAE) evaluated against true state ---
             true_state = np.array([
-                d.qpos[0], d.qpos[1], 
-                d.qvel[0], d.qvel[1], 
-                d.qpos[2], d.qvel[2]
+                d.qpos[0], d.qpos[1], d.qpos[2],
+                d.qvel[0], d.qvel[1], d.qvel[2],
+                d.qpos[3], d.qpos[4], d.qpos[5], d.qpos[6],
+                d.qvel[3], d.qvel[4], d.qvel[5]
             ])
             t_k = mpc_step_idx * mpc_dt
             step_itae = t_k * np.linalg.norm(true_state - x_target)
             
             # Saturation penalty only after 70% steady state threshold (t >= 7.0s)
             sat_penalty = 0.0
-            if mpc_step_idx >= N_ss and abs(current_gimbal) >= (delta_max - 1e-4):
+            if mpc_step_idx >= N_ss and (abs(current_gimbal_x) >= (delta_max - 1e-4) or abs(current_gimbal_y) >= (delta_max - 1e-4)):
                 sat_penalty = 100.0
                 
             cumulative_cost += step_itae + sat_penalty
             
-            # --- Optuna Pruning Hook ---
+            # --- Optuna Pruning Hook across scenarios ---
             if trial is not None:
-                trial.report(cumulative_cost, step=mpc_step_idx)
+                global_step = scenario_idx * total_mpc_steps + mpc_step_idx
+                trial.report(cost_offset + cumulative_cost, step=global_step)
                 if trial.should_prune():
                     raise optuna.TrialPruned()
             
             mpc_step_idx += 1
 
-        d.ctrl[0] = current_gimbal
-        d.ctrl[1] = current_thrust
+        d.ctrl[0] = current_gimbal_x
+        d.ctrl[1] = current_gimbal_y
+        d.ctrl[2] = current_thrust
         
         mujoco.mj_step(m, d)
         
-        # Early crash / tumbling / divergence guard
-        if d.qpos[1] < -0.1 or abs(d.qpos[2]) > np.pi / 2 or np.isnan(d.qpos[0]):
+        # Early crash guard (pz < 0 or large tilt)
+        if d.qpos[2] < 0.0 or d.qpos[3] < 0.3 or np.isnan(d.qpos[0]):
             return 1e6  # Crash penalty
 
     return cumulative_cost
@@ -136,8 +131,15 @@ def objective(trial):
     beta = trial.suggest_float('beta', 0.01, 100, log=True)
     gamma = trial.suggest_float('gamma', 0.01, 100, log=True)
 
-    cost = run_simulation(trial, alpha, beta, gamma)
-    return cost
+    # Scenario 1: Straight up to z=10 and hover
+    target_scenario_1 = np.array([0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    cost_1 = run_simulation(trial, alpha, beta, gamma, x_target=target_scenario_1, scenario_idx=0, cost_offset=0.0)
+
+    # Scenario 2: Go to x=5, y=5, z=10 and hover
+    target_scenario_2 = np.array([5.0, 5.0, 10.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    cost_2 = run_simulation(trial, alpha, beta, gamma, x_target=target_scenario_2, scenario_idx=1, cost_offset=cost_1)
+
+    return cost_1 + cost_2
 
 if __name__ == "__main__":
     pruner = optuna.pruners.PercentilePruner(
