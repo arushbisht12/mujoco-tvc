@@ -3,17 +3,31 @@
   <option gravity="0 0 -9.81"/>
   <option density="1.225" viscosity="0.00002" wind="0 0 0"/>
   
+  <visual>
+    <headlight ambient="0.4 0.4 0.4" diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1"/>
+  </visual>
+
   <worldbody>
-    <!-- Lighting and Ground -->
-    <light diffuse=".5 .5 .5" pos="0 0 3" dir="0 0 -1"/>
-    <geom type="plane" size="10 10 0.1" rgba=".9 .9 .9 1"/>
+    <light directional="true" diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3" pos="0 -5 20" dir="0 0.5 -1"/>
+    <geom type="plane" size="10 10 0.1" rgba=".4 .4 .4 1"/>
     <camera name="my_cam" pos="0 -10 2" euler="90 0 0"/>
     
-    <!-- Rocket Model -->
     <body name="rocket" pos="0 0 3">
       <joint type="free"/>
-      <geom type="cylinder" size="0.1 0.5" rgba="1 0 0 1" mass="1.0"/>
+      <!-- rocket structure + static fluid mass (m0) -->
+      <geom type="cylinder" size="0.1 0.5" rgba="1 0 0 0.5" mass="0.75"/>
       <site name="imu_site" pos="0 0 0"/>
+
+      <!-- sloshing fluid mass (m1) -->
+      <body name="slosh_dummy_x" pos="0 0 0.2457">
+        <inertial pos="0 0 0" mass="0.001" diaginertia="0.00001 0.00001 0.00001"/>
+        <joint name="slosh_x" type="slide" axis="1 0 0" stiffness="25" damping="0.3" limited="true" range="-0.15 0.15"/>
+        <body name="slosh_mass_xy" pos="0 0 0">
+          <joint name="slosh_y" type="slide" axis="0 1 0" stiffness="25" damping="0.3" limited="true" range="-0.15 0.15"/>
+          <geom type="sphere" size="0.08" rgba="0.2 0.4 0.9 0.9" mass="0.25" contype="0" conaffinity="0"/>
+        </body>
+      </body>
+
       <body name="gimbal_pitch" pos="0 0 -0.5">
         <joint name="gimbal_y" type="hinge" axis="0 1 0" range="-0.26 0.26" damping="0.5"/>
         <geom type="cylinder" size="0.085 0.02" rgba="0.4 0.4 0.4 1" mass="0.025" contype="0" conaffinity="0"/>

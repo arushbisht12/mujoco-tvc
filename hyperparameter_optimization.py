@@ -3,9 +3,10 @@ import numpy as np
 import mujoco
 import optuna
 from scipy.spatial.transform import Rotation as R
-from sensor import Accelerometer, Gyroscope, GPS
+from sensor import Accelerometer, Gyroscope, GPS, Magnetometer
 from multiplicative_ekf import MEKF
 from control import MPCController
+from util import quat_rotation_matrix
 
 XML_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "2D_rocket.xml"))
 
@@ -27,7 +28,7 @@ def run_simulation(trial, alpha, beta, gamma, x_target, scenario_idx=0, cost_off
     N_ss = int(0.7 * total_mpc_steps)
     delta_max = 0.26
     
-    current_thrust = 1.05 * 9.81  # hover thrust guess
+    current_thrust = -m.opt.gravity[2] * 1.05  # setpoint thrust
     current_gimbal_x = 0.0
     current_gimbal_y = 0.0
     
@@ -35,6 +36,8 @@ def run_simulation(trial, alpha, beta, gamma, x_target, scenario_idx=0, cost_off
     accel = Accelerometer(3, 0.005, 0.001)
     gyro = Gyroscope(3, 0.005, 0.002)
     gps = GPS(3, 0.001)
+    mag = Magnetometer(3, 0.01, 0.0)
+    gyro_accumulator = []
     
     mujoco.mj_forward(m, d)
     
@@ -55,16 +58,23 @@ def run_simulation(trial, alpha, beta, gamma, x_target, scenario_idx=0, cost_off
     np.fill_diagonal(P_initial[9:12, 9:12], 0.001)
     np.fill_diagonal(P_initial[12:15, 12:15], 0.001)
     
+    mag_world = np.array(m.opt.magnetic)
+    mag_norm = np.linalg.norm(mag_world)
+    
     mekf = MEKF(q0, v0, p0, gyro_cov, accel_cov, gyro_bias_cov, accel_bias_cov, gps_cov=gps_cov, P_initial=P_initial)
+    if mag_norm > 1e-6:
+        mekf.north_vector = (mag_world / mag_norm).reshape(3, 1)
     
     cumulative_cost = 0.0
     mpc_step_idx = 0
-    steps_to_gps = 0
+    steps_to_gps = steps_per_gps
 
     for step in range(total_physics_steps):
         # Sensor sampling
         sensor_acc = accel.sample(d.sensordata[:3], physics_dt)
         sensor_gyro = gyro.sample(d.sensordata[3:6], physics_dt)
+        sensor_mag = mag.sample(d.sensordata[6:9])
+        gyro_accumulator.append(sensor_gyro.copy())
         
         # MEKF predict
         mekf.prediction(physics_dt, sensor_gyro.reshape(3, 1), sensor_acc.reshape(3, 1))
@@ -72,27 +82,38 @@ def run_simulation(trial, alpha, beta, gamma, x_target, scenario_idx=0, cost_off
         steps_to_gps += 1
         if steps_to_gps >= steps_per_gps:
             gps_pos = gps.sample(np.array(d.qpos[0:3]).reshape(3, 1))
-            mekf.correction(physics_dt * steps_to_gps, acc=sensor_acc.reshape(3, 1), mag=None, gps=gps_pos)
+            mekf.correction(physics_dt * steps_to_gps, acc=sensor_acc.reshape(3, 1), mag=sensor_mag.reshape(3, 1), gps=gps_pos)
             steps_to_gps = 0
         
         if step % steps_per_mpc == 0:
             px, py, pz = mekf.pos[0], mekf.pos[1], mekf.pos[2]
             vx, vy, vz = mekf.vel[0], mekf.vel[1], mekf.vel[2]
             qw, qx, qy, qz = mekf.q[0], mekf.q[1], mekf.q[2], mekf.q[3]
-            wx = sensor_gyro[0] - mekf.gyr_b[0]
-            wy = sensor_gyro[1] - mekf.gyr_b[1]
-            wz = sensor_gyro[2] - mekf.gyr_b[2]
+            
+            if len(gyro_accumulator) > 0:
+                gyro_avg = np.mean(gyro_accumulator, axis=0)
+                wx = gyro_avg[0] - mekf.gyr_b[0]
+                wy = gyro_avg[1] - mekf.gyr_b[1]
+                wz = gyro_avg[2] - mekf.gyr_b[2]
+            else:
+                R_b2w = quat_rotation_matrix([qw, qx, qy, qz])
+                omega_body = R_b2w.T @ np.array([d.qvel[3], d.qvel[4], d.qvel[5]])
+                wx, wy, wz = omega_body[0], omega_body[1], omega_body[2]
+            
+            gyro_accumulator.clear()
             
             x_current = [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz]
             
             current_thrust, current_gimbal_x, current_gimbal_y = mpc.solve(x_current, x_target)
             
             # --- Incremental Partial Fitness (ITAE) evaluated against true state ---
+            R_b2w_true = quat_rotation_matrix(d.qpos[3:7])
+            omega_body_true = R_b2w_true.T @ np.array([d.qvel[3], d.qvel[4], d.qvel[5]])
             true_state = np.array([
                 d.qpos[0], d.qpos[1], d.qpos[2],
                 d.qvel[0], d.qvel[1], d.qvel[2],
                 d.qpos[3], d.qpos[4], d.qpos[5], d.qpos[6],
-                d.qvel[3], d.qvel[4], d.qvel[5]
+                omega_body_true[0], omega_body_true[1], omega_body_true[2]
             ])
             t_k = mpc_step_idx * mpc_dt
             step_itae = t_k * np.linalg.norm(true_state - x_target)
