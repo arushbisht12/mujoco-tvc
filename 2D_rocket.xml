@@ -15,11 +15,11 @@
       <geom type="cylinder" size="0.1 0.5" rgba="1 0 0 1" mass="1.0"/>
       <site name="imu_site" pos="0 0 0"/>
       <body name="gimbal_pitch" pos="0 0 -0.5">
-        <joint name="gimbal_y" type="hinge" axis="0 1 0" range="-0.26 0.26"/>
-        <geom type="cylinder" size="0.085 0.02" rgba="0.4 0.4 0.4 1" mass="0.025"/>
+        <joint name="gimbal_y" type="hinge" axis="0 1 0" range="-0.26 0.26" damping="0.5"/>
+        <geom type="cylinder" size="0.085 0.02" rgba="0.4 0.4 0.4 1" mass="0.025" contype="0" conaffinity="0"/>
         <body name="gimbal_yaw" pos="0 0 0">
-          <joint name="gimbal_x" type="hinge" axis="1 0 0" range="-0.26 0.26"/>
-          <geom type="cylinder" size="0.08 0.1" pos="0 0 -0.05" rgba="0.3 0.3 0.3 1" mass="0.025"/>
+          <joint name="gimbal_x" type="hinge" axis="1 0 0" range="-0.26 0.26" damping="0.5"/>
+          <geom type="cylinder" size="0.08 0.1" pos="0 0 -0.05" rgba="0.3 0.3 0.3 1" mass="0.025" contype="0" conaffinity="0"/>
           <site name="thrust_site" pos="0 0 -0.1"/>
         </body>
       </body>
@@ -28,6 +28,7 @@
   <sensor>
     <accelerometer name="body_accel" site="imu_site"/>
     <gyro name="body_gyro" site="imu_site"/>
+    <magnetometer name="body_mag" site="imu_site"/>
   </sensor>
   <actuator>
     <position joint="gimbal_x" kp="50" ctrlrange="-0.26 0.26" ctrllimited="true"/>

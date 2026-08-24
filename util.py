@@ -11,12 +11,21 @@ def skewSymmetric(v):
   return 2.0*np.outer(q, q.vector) \
            + np.identity(3)*(q.scalar**2 - q.vector.dot(q.vector)) \
            + 2*q.scalar*skewSymmetric(q.vector)"""
+
+def quat_rotation_matrix(q):
+    """Build rotation matrix R_b2w from quaternion [w,x,y,z]."""
+    qw, qx, qy, qz = q[0], q[1], q[2], q[3]
+    return np.array([
+        [1.0 - 2.0*(qy**2 + qz**2), 2.0*(qx*qy - qw*qz),       2.0*(qx*qz + qw*qy)],
+        [2.0*(qx*qy + qw*qz),       1.0 - 2.0*(qx**2 + qz**2), 2.0*(qy*qz - qw*qx)],
+        [2.0*(qx*qz - qw*qy),       2.0*(qy*qz + qw*qx),       1.0 - 2.0*(qx**2 + qy**2)]
+    ])
            
-def quatToMatrix(q): # body to inertial
+"""def quatToMatrix(q): # body to inertial
     q = Quaternion(q)
     return 2.0*np.outer(q, q.vector) \
             + np.identity(3)*(q.scalar**2 - q.vector.dot(q.vector)) \
-            + 2*q.scalar*skewSymmetric(q.vector)
+            + 2*q.scalar*skewSymmetric(q.vector)"""
 
 def quat_multiply(q, r):
   """Multiplies two quaternions q and r."""

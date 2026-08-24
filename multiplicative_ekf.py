@@ -1,6 +1,6 @@
 import numpy as np
 from numpy import linalg as la
-from util import skewSymmetric, quatToMatrix, quat_multiply, quat_to_euler
+from util import skewSymmetric, quat_multiply, quat_to_euler, quat_rotation_matrix
 from pyquaternion import Quaternion
 
 class MEKF:
@@ -120,8 +120,8 @@ class MEKF:
         G = np.zeros(shape=(15, 15), dtype=float)
         
         G[0:3, 0:3] = -skewSymmetric(gyr)
-        G[3:6, 0:3] = -quatToMatrix(self.q) @ skewSymmetric(acc)
-        G[3:6, 12:15] = -quatToMatrix(self.q)
+        G[3:6, 0:3] = -quat_rotation_matrix(self.q) @ skewSymmetric(acc)
+        G[3:6, 12:15] = -quat_rotation_matrix(self.q)
         G[6:9, 3:6] = np.identity(3, dtype=float)
         G[0:3, 9:12] = -np.identity(3, dtype=float)
         
@@ -170,9 +170,9 @@ class MEKF:
         H = np.zeros(shape = (11,15), dtype=float)
         
         H[0:3, 0:3] = skewSymmetric( self.rotation_earth_to_body(self.q) @ self.g_vector)
-        H[0:3, 12:15] = np.identity(3, dtype=float)
+        # H[0:3, 12:15] = np.identity(3, dtype=float) # REMOVED: acc_b is in m/s^2, acc_norm is unitless
         H[3:6, 0:3] = skewSymmetric( self.rotation_earth_to_body(self.q) @ self.north_vector)
-        H[3:6, 12:15] = np.identity(3, dtype=float)
+        # H[3:6, 12:15] = np.identity(3, dtype=float) # BUG: Magnetometer does not depend on accelerometer bias!
         H[6:9, 6:9] = np.identity(3, dtype=float)
         H[9, 8] = 1.0
         H[10, 8] = 1.0
