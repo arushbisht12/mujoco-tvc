@@ -2,9 +2,10 @@ import casadi as ca
 import numpy as np
 
 class MPCController:
-    def __init__(self, N=20, dt=0.1, alpha=1.0, beta=1.0, gamma=1.0):
+    def __init__(self, N=20, dt=0.1, alpha=1.0, beta=1.0, gamma=1.0, ground_clearance=0.5):
         self.N = N
         self.dt = dt
+        self.ground_clearance = ground_clearance
         
         # Physical parameters
         m = 1.05       # mass (kg)
@@ -118,8 +119,8 @@ class MPCController:
             # Dynamics constraints
             self.opti.subject_to(self.X[:, k+1] == f_discrete(self.X[:, k], self.U[:, k]))
             
-            # State constraints: pz >= 0
-            self.opti.subject_to(self.X[2, k+1] >= 0.0)
+            # State constraints: pz >= ground_clearance (rocket center of mass height on ground)
+            self.opti.subject_to(self.X[2, k+1] >= self.ground_clearance)
             
             # Control constraints
             self.opti.subject_to(self.opti.bounded(0.0, self.U[0, k], 20.0))       # Thrust limits

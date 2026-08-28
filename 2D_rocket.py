@@ -88,13 +88,18 @@ def initialize_controller1(m, d):
     """
     global planner, tracker, x_land, last_guidance_time, guidance_plan_start_time, last_tracker_time
     global current_thrust, current_gimbal_x, current_gimbal_y, t_final_current, engine_cut, landing_evaluated
-    global x_target
+    global x_target, ground_clearance
     
-    planner = MPCPlanner(N=30, alpha=1.0, beta=1.0, gamma=1.0)
-    tracker = MPCController(N=15, dt=0.1, alpha=16.68276963291755, beta=0.5843884594990272, gamma=4.485854411546921)
+    # Infer ground clearance from XML (half-length of the rocket's main cylinder)
+    rocket_body_id = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "rocket")
+    geom_id = m.body_geomadr[rocket_body_id]
+    ground_clearance = float(m.geom_size[geom_id, 1])
+    
+    planner = MPCPlanner(N=60, alpha=1.0, beta=1.0, gamma=1.0, ground_clearance=ground_clearance)
+    tracker = MPCController(N=15, dt=0.1, alpha=16.68276963291755, beta=0.5843884594990272, gamma=4.485854411546921, ground_clearance=ground_clearance)
     
     # Target landing state (6D): [px, py, pz, vx, vy, vz]
-    x_land = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    x_land = [0.0, 0.0, ground_clearance, 0.0, 0.0, 0.0]
     
     current_thrust = -m.opt.gravity[2] * 1.05
     current_gimbal_x = 0.0
@@ -103,7 +108,7 @@ def initialize_controller1(m, d):
     last_guidance_time = -1.0
     guidance_plan_start_time = 0.0
     last_tracker_time = -1.0
-    t_final_current = 0.0
+    t_final_current = 1e4
     engine_cut = False
     landing_evaluated = False
     
@@ -151,7 +156,7 @@ def controller1(m, d):
         x_current_13d = [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz]
 
     # 1. High-Level Guidance MPC update (at 2 Hz -> every 0.5 s)
-    if d.time - last_guidance_time >= 0.5:
+    if d.time - last_guidance_time >= 0.5 and t_final_current > 3.0:
         t_plan_start = time.perf_counter()
         t_grid, X_res, U_res, t_final_val = planner.solve(x_current_6d, x_land)
         t_plan_loop = time.perf_counter() - t_plan_start
@@ -160,8 +165,8 @@ def controller1(m, d):
         t_final_current = t_final_val
         print(f"[Guidance 2Hz] t={d.time:.2f}s | Tf*={t_final_val:.2f}s | Pos=({px:.2f}, {py:.2f}, {pz:.2f}) | Solve={t_plan_loop*1000:.1f}ms")
 
-    # 2. Low-Level Tracking MPC update (at 10 Hz -> every 0.1 s)
-    if d.time - last_tracker_time >= 0.1:
+    # 2. Low-Level Tracking MPC update (at 40 Hz -> every 0.025 s)
+    if d.time - last_tracker_time >= 0.025:
         gyro_accumulator.clear()  # reset gyro accumulator for next period
         
         # Sample the interpolated 13D trajectory over preview horizon
@@ -181,17 +186,14 @@ def controller1(m, d):
         last_tracker_time = d.time
 
     # 3. Touchdown & Landing Evaluation
-    if pz < 0.25:
+    if pz < ground_clearance + 0.25:
         vel_mag = np.linalg.norm([vx, vy, vz])
-        if not landing_evaluated:
-            landing_evaluated = True
-            if vel_mag < 2.0:
+        if not engine_cut:
+            if vel_mag < 0.5: 
                 print(f"Landing successful! Velocity: {vel_mag:.2f} m/s. Cutting engine.")
                 engine_cut = True
             else:
                 print(f"Landing alert: Touchdown velocity: {vel_mag:.2f} m/s.")
-        if pz < 0.1:
-            engine_cut = True
 
     # 4. Actuation
     if engine_cut:

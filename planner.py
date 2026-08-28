@@ -3,8 +3,12 @@ import numpy as np
 from scipy.interpolate import interp1d
 
 class MPCPlanner:
-    def __init__(self, N=30, alpha=1.0, beta=1.0, gamma=1.0):
+    def __init__(self, N=40, alpha=1.0, beta=1.0, gamma=1.0, ground_clearance=0.5):
         self.N = N
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.ground_clearance = ground_clearance
         
         # Physical parameters
         self.m = 1.05       # mass (kg)
@@ -73,7 +77,14 @@ class MPCPlanner:
             self.opti.subject_to(self.X[:, k+1] == x_next)
             
             # Altitude constraint
-            self.opti.subject_to(self.X[2, k] >= 0.0)
+            self.opti.subject_to(self.X[2, k] >= self.ground_clearance)
+            
+            # Velocity-altitude glide slope (forces slower descent near the ground)
+            # vz >= -0.6 * pz - 0.2 (max 0.2 m/s descent at touchdown, linearly scaling with altitude)
+            self.opti.subject_to(self.X[5, k] >= -0.6 * (self.X[2, k] - self.ground_clearance) - 0.2)
+            eps = 1e-6
+            self.opti.subject_to(ca.sqrt(self.X[4, k]**2 + eps) <= 0.6 * self.X[1, k] + 0.1)
+            self.opti.subject_to(ca.sqrt(self.X[3, k]**2 + eps) <= 0.6 * self.X[0, k] + 0.1)
             
             # Control constraints
             F_k = self.U[:, k]
@@ -90,7 +101,7 @@ class MPCPlanner:
                 cost += ca.mtimes([du.T, S, du])
                 
         # Terminal altitude constraint
-        self.opti.subject_to(self.X[2, N] >= 0.0)
+        self.opti.subject_to(self.X[2, N] >= self.ground_clearance)
         
         # Boundary conditions
         self.opti.subject_to(self.X[:, 0] == self.x_init)
@@ -101,7 +112,7 @@ class MPCPlanner:
         # Tuned IPOPT solver options
         p_opts = {"expand": True, "print_time": False}
         s_opts = {
-            "max_iter": 150,
+            "max_iter": 200,
             "tol": 1e-3,
             "dual_inf_tol": 1e-2,
             "constr_viol_tol": 1e-3,
@@ -219,12 +230,12 @@ class MPCPlanner:
         t_preview_clamped = np.clip(t_preview, 0.0, self.T_f_sol)
         
         # Interpolate 6D state (px, py, pz, vx, vy, vz)
-        interp_X = interp1d(self.t_grid_sol, self.X_sol, axis=1, kind='linear', fill_value="extrapolate")
+        interp_X = interp1d(self.t_grid_sol, self.X_sol, axis=1, kind='cubic', fill_value="extrapolate")
         X_preview = interp_X(t_preview_clamped)  # (6, N_low + 1)
         
         # Interpolate 3D control force (Fx, Fy, Fz)
         t_u_grid = self.t_grid_sol[:-1]
-        interp_U = interp1d(t_u_grid, self.U_sol, axis=1, kind='linear', fill_value="extrapolate")
+        interp_U = interp1d(t_u_grid, self.U_sol, axis=1, kind='cubic', fill_value="extrapolate")
         U_preview = interp_U(t_preview_clamped)  # (3, N_low + 1)
         
         traj_13d = np.zeros((13, N_low + 1))
