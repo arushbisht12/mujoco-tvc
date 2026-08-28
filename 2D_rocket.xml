@@ -12,7 +12,7 @@
     <geom type="plane" size="10 10 0.1" rgba=".4 .4 .4 1"/>
     <camera name="my_cam" pos="0 -10 2" euler="90 0 0"/>
     
-    <body name="rocket" pos="0 0 3">
+    <body name="rocket" pos="5 5 15">
       <joint type="free"/>
       <!-- rocket structure + static fluid mass (m0) -->
       <geom type="cylinder" size="0.1 0.5" rgba="1 0 0 0.5" mass="0.75"/>

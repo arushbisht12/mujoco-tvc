@@ -111,7 +111,7 @@ class MPCController:
         self.U = self.opti.variable(3, N)
         
         self.x_init = self.opti.parameter(13)
-        self.x_ref = self.opti.parameter(13)
+        self.X_ref = self.opti.parameter(13, N+1)
         
         cost = 0
         for k in range(N):
@@ -126,8 +126,8 @@ class MPCController:
             self.opti.subject_to(self.opti.bounded(-0.26, self.U[1, k], 0.26))     # Gimbal X limits (+-15 deg)
             self.opti.subject_to(self.opti.bounded(-0.26, self.U[2, k], 0.26))     # Gimbal Y limits (+-15 deg)
             
-            # Stage cost
-            err = self.X[:, k] - self.x_ref
+            # Stage cost (tracking trajectory at each step k)
+            err = self.X[:, k] - self.X_ref[:, k]
             cost += ca.mtimes([err.T, Q, err])
             cost += ca.mtimes([self.U[:, k].T, R, self.U[:, k]])
             
@@ -137,7 +137,7 @@ class MPCController:
                 cost += ca.mtimes([du.T, S, du])
                 
         # Terminal cost
-        err_N = self.X[:, N] - self.x_ref
+        err_N = self.X[:, N] - self.X_ref[:, N]
         cost += ca.mtimes([err_N.T, Q_terminal, err_N])
         
         # Boundary conditions
@@ -158,6 +158,8 @@ class MPCController:
             "warm_start_init_point": "yes",
             "warm_start_bound_push": 1e-4,
             "warm_start_mult_bound_push": 1e-4,
+            "mu_strategy": "adaptive",
+            "mu_init": 1e-3,
             "print_level": 0,
             "sb": "yes"
         }
@@ -168,24 +170,36 @@ class MPCController:
         self.U_prev[0, :] = m * g # initial guess hover thrust
         self.X_prev = None
 
-    def solve(self, x_current, x_target):
-        self.opti.set_value(self.x_init, x_current)
-        self.opti.set_value(self.x_ref, x_target)
-        
-        # Warm start both control and state trajectory
-        self.opti.set_initial(self.U, self.U_prev)
-        if self.X_prev is not None:
-            self.opti.set_initial(self.X, self.X_prev)
-        
+        self.solve_fn = self.opti.to_function(
+            'mpc_step',
+            [self.x_init, self.X_ref, self.opti.x, self.opti.lam_g],
+            [self.U[:, 0], self.opti.x, self.opti.lam_g]
+        )
+        self.primal_guess = np.zeros(self.opti.x.shape[0])
+        self.dual_guess = np.zeros(self.opti.lam_g.shape[0])
+        self.u_prev = (m * g, 0.0, 0.0)  # Default hover thrust fallback
+
+    def solve(self, x_current, traj_ref):
         try:
-            sol = self.opti.solve()
-            U_res = sol.value(self.U)
-            X_res = sol.value(self.X)
-            # Shift horizon for warm starting next step
-            self.U_prev = np.hstack([U_res[:, 1:], U_res[:, -1:]])
-            self.X_prev = np.hstack([X_res[:, 1:], X_res[:, -1:]])
-            # Return F, delta_x, delta_y for timestep 0
-            return float(U_res[0, 0]), float(U_res[1, 0]), float(U_res[2, 0])
+            # Handle both single state (13,) and trajectory matrix (13, N+1) or (N+1, 13)
+            traj_arr = np.asarray(traj_ref, dtype=float)
+            if traj_arr.ndim == 1:
+                # Single state target: tile across the entire horizon
+                traj_mat = np.tile(traj_arr.reshape(13, 1), (1, self.N + 1))
+            elif traj_arr.shape == (self.N + 1, 13):
+                traj_mat = traj_arr.T
+            elif traj_arr.shape == (13, self.N + 1):
+                traj_mat = traj_arr
+            else:
+                raise ValueError(f"traj_ref must have shape (13,), (13, {self.N+1}), or ({self.N+1}, 13), got {traj_arr.shape}")
+
+            # solve_fn evaluates the compiled NLP graph and updates primal/dual warm starts
+            u0, self.primal_guess, self.dual_guess = self.solve_fn(
+                x_current, traj_mat, self.primal_guess, self.dual_guess
+            )
+            self.u_prev = (float(u0[0]), float(u0[1]), float(u0[2]))
+            return self.u_prev
         except Exception as e:
             print(f"MPC Failed, using previous command: {e}")
-            return float(self.U_prev[0, 0]), float(self.U_prev[1, 0]), float(self.U_prev[2, 0])
+            return self.u_prev
+

@@ -11,6 +11,7 @@ from scipy.spatial.transform import Rotation as R
 from sensor import Accelerometer, Gyroscope, GPS, Magnetometer
 from multiplicative_ekf import MEKF
 from control import MPCController
+from planner import MPCPlanner
 from util import quat_to_euler, quat_rotation_matrix
 
 XML_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "2D_rocket.xml"))
@@ -32,8 +33,15 @@ def load_model():
     return m, d
 
 mpc = None
+planner = None
+tracker = None
 x_target = None
+x_land = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 last_mpc_time = -1.0
+last_guidance_time = -1.0
+guidance_plan_start_time = 0.0
+last_tracker_time = -1.0
+t_final_current = 0.0
 current_thrust = 0.0
 current_gimbal_x = 0.0
 current_gimbal_y = 0.0
@@ -59,7 +67,7 @@ def init_controller(m, d):
 
 def init_trajectory_controller(m, d):
     global mpc, x_target, current_thrust, waypoints, current_waypoint_index, waypoint_arrival_time
-    mpc = MPCController(N=20, dt=0.1, alpha=0.24, beta=0.04, gamma=3.12)
+    mpc = MPCController(N=15, dt=0.1, alpha=16.68276963291755, beta=0.5843884594990272, gamma=4.485854411546921)
     
     waypoints = [
         [2.0, 0.0, 15.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],  # Up and to the right
@@ -71,6 +79,129 @@ def init_trajectory_controller(m, d):
     waypoint_arrival_time = None
     
     current_thrust = -m.opt.gravity[2] * 1.05
+
+def initialize_controller1(m, d):
+    """
+    Initializes the 2-level controller:
+    - High-level guidance MPCPlanner (free final time optimization)
+    - Low-level trajectory-tracking MPCController (6-DOF rigid body MPC)
+    """
+    global planner, tracker, x_land, last_guidance_time, guidance_plan_start_time, last_tracker_time
+    global current_thrust, current_gimbal_x, current_gimbal_y, t_final_current, engine_cut, landing_evaluated
+    global x_target
+    
+    planner = MPCPlanner(N=30, alpha=1.0, beta=1.0, gamma=1.0)
+    tracker = MPCController(N=15, dt=0.1, alpha=16.68276963291755, beta=0.5843884594990272, gamma=4.485854411546921)
+    
+    # Target landing state (6D): [px, py, pz, vx, vy, vz]
+    x_land = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    
+    current_thrust = -m.opt.gravity[2] * 1.05
+    current_gimbal_x = 0.0
+    current_gimbal_y = 0.0
+    
+    last_guidance_time = -1.0
+    guidance_plan_start_time = 0.0
+    last_tracker_time = -1.0
+    t_final_current = 0.0
+    engine_cut = False
+    landing_evaluated = False
+    
+    x_target = [d.qpos[0], d.qpos[1], d.qpos[2], 0.0, 0.0, 0.0, d.qpos[3], d.qpos[4], d.qpos[5], d.qpos[6], 0.0, 0.0, 0.0]
+    print("Initialized 2-Level Controller: High-Level Guidance MPC + Low-Level Tracker MPC.")
+
+def controller1(m, d):
+    """
+    2-Level Hierarchical Controller:
+    - Guidance planner runs at 2 Hz solving free final time trajectory
+    - Tracking MPC runs at 10 Hz following interpolated trajectory preview
+    """
+    global planner, tracker, x_land, last_guidance_time, guidance_plan_start_time, last_tracker_time
+    global current_thrust, current_gimbal_x, current_gimbal_y, t_final_current, engine_cut, landing_evaluated
+    global mekf, latest_sensor_gyro, use_mekf, gyro_accumulator, x_target
+
+    # Extract state feedback from MEKF or ground truth
+    if use_mekf and mekf is not None:
+        px, py, pz = float(mekf.pos[0]), float(mekf.pos[1]), float(mekf.pos[2])
+        vx, vy, vz = float(mekf.vel[0]), float(mekf.vel[1]), float(mekf.vel[2])
+        qw, qx, qy, qz = float(mekf.q[0]), float(mekf.q[1]), float(mekf.q[2]), float(mekf.q[3])
+        
+        if len(gyro_accumulator) > 0:
+            gyro_avg = np.mean(gyro_accumulator, axis=0)
+            wx = float(gyro_avg[0] - mekf.gyr_b[0])
+            wy = float(gyro_avg[1] - mekf.gyr_b[1])
+            wz = float(gyro_avg[2] - mekf.gyr_b[2])
+        else:
+            R_b2w = quat_rotation_matrix([qw, qx, qy, qz])
+            omega_body = R_b2w.T @ np.array([d.qvel[3], d.qvel[4], d.qvel[5]])
+            wx, wy, wz = float(omega_body[0]), float(omega_body[1]), float(omega_body[2])
+            
+        x_current_6d = [px, py, pz, vx, vy, vz]
+        x_current_13d = [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz]
+    else:
+        q = d.qpos[3:7]
+        qw, qx, qy, qz = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+        R_b2w = quat_rotation_matrix([qw, qx, qy, qz])
+        omega_body = R_b2w.T @ np.array([d.qvel[3], d.qvel[4], d.qvel[5]])
+        px, py, pz = float(d.qpos[0]), float(d.qpos[1]), float(d.qpos[2])
+        vx, vy, vz = float(d.qvel[0]), float(d.qvel[1]), float(d.qvel[2])
+        wx, wy, wz = float(omega_body[0]), float(omega_body[1]), float(omega_body[2])
+        
+        x_current_6d = [px, py, pz, vx, vy, vz]
+        x_current_13d = [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz]
+
+    # 1. High-Level Guidance MPC update (at 2 Hz -> every 0.5 s)
+    if d.time - last_guidance_time >= 0.5:
+        t_plan_start = time.perf_counter()
+        t_grid, X_res, U_res, t_final_val = planner.solve(x_current_6d, x_land)
+        t_plan_loop = time.perf_counter() - t_plan_start
+        last_guidance_time = d.time
+        guidance_plan_start_time = d.time
+        t_final_current = t_final_val
+        print(f"[Guidance 2Hz] t={d.time:.2f}s | Tf*={t_final_val:.2f}s | Pos=({px:.2f}, {py:.2f}, {pz:.2f}) | Solve={t_plan_loop*1000:.1f}ms")
+
+    # 2. Low-Level Tracking MPC update (at 10 Hz -> every 0.1 s)
+    if d.time - last_tracker_time >= 0.1:
+        gyro_accumulator.clear()  # reset gyro accumulator for next period
+        
+        # Sample the interpolated 13D trajectory over preview horizon
+        traj_ref_13d = planner.get_reference_trajectory(
+            d.time,
+            guidance_plan_start_time,
+            N_low=tracker.N,
+            dt_low=tracker.dt
+        )
+        
+        # Update current reference setpoint for visual telemetry
+        x_target = traj_ref_13d[:3, 0].tolist()
+        
+        t_track_start = time.perf_counter()
+        current_thrust, current_gimbal_x, current_gimbal_y = tracker.solve(x_current_13d, traj_ref_13d)
+        t_track_loop = time.perf_counter() - t_track_start
+        last_tracker_time = d.time
+
+    # 3. Touchdown & Landing Evaluation
+    if pz < 0.25:
+        vel_mag = np.linalg.norm([vx, vy, vz])
+        if not landing_evaluated:
+            landing_evaluated = True
+            if vel_mag < 2.0:
+                print(f"Landing successful! Velocity: {vel_mag:.2f} m/s. Cutting engine.")
+                engine_cut = True
+            else:
+                print(f"Landing alert: Touchdown velocity: {vel_mag:.2f} m/s.")
+        if pz < 0.1:
+            engine_cut = True
+
+    # 4. Actuation
+    if engine_cut:
+        d.ctrl[0] = 0.0
+        d.ctrl[1] = 0.0
+        d.ctrl[2] = 0.0
+    else:
+        d.ctrl[0] = current_gimbal_x
+        d.ctrl[1] = current_gimbal_y
+        d.ctrl[2] = current_thrust
 
 def controller(m, d):
     global last_mpc_time, current_thrust, current_gimbal_x, current_gimbal_y, mekf, latest_sensor_gyro, use_mekf, gyro_accumulator
@@ -153,8 +284,10 @@ def controller(m, d):
                 qw, qx, qy, qz,
                 omega_body[0], omega_body[1], omega_body[2]
             ]
-        
+        t_mpc_start = time.perf_counter()
         current_thrust, current_gimbal_x, current_gimbal_y = mpc.solve(x_current, x_target)
+        t_mpc_loop = time.perf_counter() - t_mpc_start
+        print(f"MPC loop time: {t_mpc_loop * 1000:.2f} ms | Max Freq: {1/(t_mpc_loop):.2f} Hz")
         last_mpc_time = d.time
         
     if engine_cut:
@@ -165,6 +298,7 @@ def controller(m, d):
         d.ctrl[0] = current_gimbal_x
         d.ctrl[1] = current_gimbal_y
         d.ctrl[2] = current_thrust
+
 
 def main():
     global mekf, latest_sensor_gyro
@@ -220,8 +354,8 @@ def main():
         mekf.north_vector = (mag_world / mag_norm).reshape(3, 1)
         print(f"MEKF north_vector aligned to MuJoCo magnetic field: {mekf.north_vector.flatten()}")
 
-    init_trajectory_controller(m, d)
-    mj.set_mjcb_control(controller)
+    initialize_controller1(m, d)
+    mj.set_mjcb_control(controller1)
 
     # Rerun blueprint (2x3 grid)
     common_x = rrb.TimeAxis(
@@ -250,9 +384,9 @@ def main():
     steps_to_render = steps_per_render
     steps_to_gps = steps_per_gps
 
-    with mj.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as viewer:
+    with mj.viewer.launch_passive(m, d, show_left_ui=True, show_right_ui=True) as viewer:
         # startup delay
-        wait_time = 35.0
+        wait_time = 5.0
         wall_start_time = time.time()
         print(f"Waiting {wait_time} seconds for you to arrange windows...")
         
@@ -311,6 +445,9 @@ def main():
                 rr.log("control/thrust", rr.Scalars(current_thrust))
                 rr.log("control/gimbal_x", rr.Scalars(current_gimbal_x))
                 rr.log("control/gimbal_y", rr.Scalars(current_gimbal_y))
+
+                # Log guidance optimal time-to-go
+                rr.log("guidance/t_final", rr.Scalars(t_final_current))
 
                 steps_to_render = 0
 
