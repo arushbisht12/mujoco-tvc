@@ -93,7 +93,7 @@ def initialize_controller1(m, d):
     # Infer ground clearance from XML (half-length of the rocket's main cylinder)
     rocket_body_id = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "rocket")
     geom_id = m.body_geomadr[rocket_body_id]
-    ground_clearance = float(m.geom_size[geom_id, 1])
+    ground_clearance = float(m.geom_size[geom_id, 1]) + 0.25
     
     planner = MPCPlanner(N=60, alpha=1.0, beta=1.0, gamma=1.0, ground_clearance=ground_clearance)
     tracker = MPCController(N=15, dt=0.1, alpha=16.68276963291755, beta=0.5843884594990272, gamma=4.485854411546921, ground_clearance=ground_clearance)
@@ -111,7 +111,6 @@ def initialize_controller1(m, d):
     t_final_current = 1e4
     engine_cut = False
     landing_evaluated = False
-    
     x_target = [d.qpos[0], d.qpos[1], d.qpos[2], 0.0, 0.0, 0.0, d.qpos[3], d.qpos[4], d.qpos[5], d.qpos[6], 0.0, 0.0, 0.0]
     print("Initialized 2-Level Controller: High-Level Guidance MPC + Low-Level Tracker MPC.")
 
@@ -155,7 +154,7 @@ def controller1(m, d):
         x_current_6d = [px, py, pz, vx, vy, vz]
         x_current_13d = [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz]
 
-    # 1. High-Level Guidance MPC update (at 2 Hz -> every 0.5 s)
+    # High-Level Guidance MPC update (2Hz)
     if d.time - last_guidance_time >= 0.5 and t_final_current > 3.0:
         t_plan_start = time.perf_counter()
         t_grid, X_res, U_res, t_final_val = planner.solve(x_current_6d, x_land)
@@ -165,7 +164,7 @@ def controller1(m, d):
         t_final_current = t_final_val
         print(f"[Guidance 2Hz] t={d.time:.2f}s | Tf*={t_final_val:.2f}s | Pos=({px:.2f}, {py:.2f}, {pz:.2f}) | Solve={t_plan_loop*1000:.1f}ms")
 
-    # 2. Low-Level Tracking MPC update (at 40 Hz -> every 0.025 s)
+    # Low-Level Tracking MPC update (40 Hz)
     if d.time - last_tracker_time >= 0.025:
         gyro_accumulator.clear()  # reset gyro accumulator for next period
         
@@ -186,11 +185,12 @@ def controller1(m, d):
         last_tracker_time = d.time
 
     # 3. Touchdown & Landing Evaluation
-    if pz < ground_clearance + 0.25:
+    if pz < ground_clearance + 0.05:
         vel_mag = np.linalg.norm([vx, vy, vz])
         if not engine_cut:
-            if vel_mag < 0.5: 
+            if vel_mag < 0.2: 
                 print(f"Landing successful! Velocity: {vel_mag:.2f} m/s. Cutting engine.")
+                print(f"Final Position: ({px:.2f}, {py:.2f}, {pz:.2f})")
                 engine_cut = True
             else:
                 print(f"Landing alert: Touchdown velocity: {vel_mag:.2f} m/s.")
@@ -417,6 +417,9 @@ def main():
                 gps_pos = gps.sample(np.array(d.qpos[0:3]).reshape(3, 1))
                 mekf.correction(physics_dt * steps_to_gps, acc=sensor_acc.reshape(3, 1), mag=sensor_mag.reshape(3, 1), gps=gps_pos)
                 steps_to_gps = 0
+
+                if engine_cut:
+                    print(f"Final Position: ({mekf.pos})")
 
             if steps_to_render >= steps_per_render:
                 rr.set_time("sim_time", sequence=int(d.time/physics_dt))
