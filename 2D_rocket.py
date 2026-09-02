@@ -1,5 +1,7 @@
 import os
 import time
+import multiprocessing as mp
+
 import mujoco as mj
 import mujoco.viewer
 
@@ -11,7 +13,7 @@ from scipy.spatial.transform import Rotation as R
 from sensor import Accelerometer, Gyroscope, GPS, Magnetometer
 from multiplicative_ekf import MEKF
 from control import MPCController
-from planner import MPCPlanner
+from planner import MPCPlanner, GuidanceTrajectory, guidance_worker_loop
 from util import quat_to_euler, quat_rotation_matrix
 
 XML_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "2D_rocket.xml"))
@@ -83,19 +85,38 @@ def init_trajectory_controller(m, d):
 def initialize_controller1(m, d):
     """
     Initializes the 2-level controller:
-    - High-level guidance MPCPlanner (free final time optimization)
+    - High-level guidance worker process (free final time optimization)
     - Low-level trajectory-tracking MPCController (6-DOF rigid body MPC)
     """
-    global planner, tracker, x_land, last_guidance_time, guidance_plan_start_time, last_tracker_time
+    global tracker, x_land, last_guidance_time, last_tracker_time
     global current_thrust, current_gimbal_x, current_gimbal_y, t_final_current, engine_cut, landing_evaluated
     global x_target, ground_clearance
+    global worker_process, guidance_req_queue, guidance_res_queue, latest_trajectory, guidance_is_busy
     
     # Infer ground clearance from XML (half-length of the rocket's main cylinder)
     rocket_body_id = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "rocket")
     geom_id = m.body_geomadr[rocket_body_id]
     ground_clearance = float(m.geom_size[geom_id, 1]) + 0.25
     
-    planner = MPCPlanner(N=60, alpha=1.0, beta=1.0, gamma=1.0, ground_clearance=ground_clearance)
+    guidance_req_queue = mp.Queue(maxsize=1)
+    guidance_res_queue = mp.Queue(maxsize=1)
+    latest_trajectory = None
+    guidance_is_busy = False
+
+    planner_config = {
+        "N": 60,
+        "alpha": 1.0,
+        "beta": 1.0,
+        "gamma": 1.0,
+        "ground_clearance": ground_clearance
+    }
+    worker_process = mp.Process(
+        target=guidance_worker_loop,
+        args=(guidance_req_queue, guidance_res_queue, planner_config),
+        daemon=True
+    )
+    worker_process.start()
+    
     tracker = MPCController(N=15, dt=0.1, alpha=16.68276963291755, beta=0.5843884594990272, gamma=4.485854411546921, ground_clearance=ground_clearance)
     
     # Target landing state (6D): [px, py, pz, vx, vy, vz]
@@ -106,23 +127,29 @@ def initialize_controller1(m, d):
     current_gimbal_y = 0.0
     
     last_guidance_time = -1.0
-    guidance_plan_start_time = 0.0
     last_tracker_time = -1.0
     t_final_current = 1e4
     engine_cut = False
     landing_evaluated = False
     x_target = [d.qpos[0], d.qpos[1], d.qpos[2], 0.0, 0.0, 0.0, d.qpos[3], d.qpos[4], d.qpos[5], d.qpos[6], 0.0, 0.0, 0.0]
-    print("Initialized 2-Level Controller: High-Level Guidance MPC + Low-Level Tracker MPC.")
+
+    # Trigger initial guidance plan request
+    x_init_6d = [d.qpos[0], d.qpos[1], d.qpos[2], 0.0, 0.0, 0.0]
+    guidance_req_queue.put((d.time, x_init_6d, x_land, None))
+    guidance_is_busy = True
+    last_guidance_time = d.time
+    print("Initialized 2-Level Controller: High-Level Async Guidance Worker + Low-Level Tracker MPC.")
 
 def controller1(m, d):
     """
     2-Level Hierarchical Controller:
-    - Guidance planner runs at 2 Hz solving free final time trajectory
-    - Tracking MPC runs at 10 Hz following interpolated trajectory preview
+    - Guidance planner runs asynchronously in worker process (~2 Hz)
+    - Tracking MPC runs at 40 Hz sampling continuous interpolated trajectory
     """
-    global planner, tracker, x_land, last_guidance_time, guidance_plan_start_time, last_tracker_time
+    global tracker, x_land, last_guidance_time, last_tracker_time
     global current_thrust, current_gimbal_x, current_gimbal_y, t_final_current, engine_cut, landing_evaluated
-    global mekf, latest_sensor_gyro, use_mekf, gyro_accumulator, x_target
+    global mekf, latest_sensor_gyro, use_mekf, gyro_accumulator, x_target, ground_clearance
+    global guidance_req_queue, guidance_res_queue, latest_trajectory, guidance_is_busy
 
     # Extract state feedback from MEKF or ground truth
     if use_mekf and mekf is not None:
@@ -154,28 +181,46 @@ def controller1(m, d):
         x_current_6d = [px, py, pz, vx, vy, vz]
         x_current_13d = [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz]
 
-    # High-Level Guidance MPC update (2Hz)
-    if d.time - last_guidance_time >= 0.5 and t_final_current > 3.0:
-        t_plan_start = time.perf_counter()
-        t_grid, X_res, U_res, t_final_val = planner.solve(x_current_6d, x_land)
-        t_plan_loop = time.perf_counter() - t_plan_start
-        last_guidance_time = d.time
-        guidance_plan_start_time = d.time
-        t_final_current = t_final_val
-        print(f"[Guidance 2Hz] t={d.time:.2f}s | Tf*={t_final_val:.2f}s | Pos=({px:.2f}, {py:.2f}, {pz:.2f}) | Solve={t_plan_loop*1000:.1f}ms")
+    # 1. Check for incoming guidance solutions from worker (non-blocking)
+    if guidance_res_queue is not None and not guidance_res_queue.empty():
+        try:
+            res = guidance_res_queue.get_nowait()
+            latest_trajectory = res["trajectory"]
+            t_final_current = res["t_final"]
+            guidance_is_busy = False
+            lag_ms = (d.time - res["t_req"]) * 1000.0
+            print(f"[Async Guidance] Received plan at t={d.time:.2f}s | Tf*={t_final_current:.2f}s | Solve lag={lag_ms:.1f}ms")
+        except mp.queues.Empty:
+            pass
 
-    # Low-Level Tracking MPC update (40 Hz)
+    # 2. Trigger next open-loop guidance update at 2 Hz
+    if (d.time - last_guidance_time >= 0.5) and not guidance_is_busy and t_final_current > 3.0:
+        t_elapsed = d.time - last_guidance_time
+        try:
+            # Open-loop step: send x_init=None so planner samples from previous trajectory
+            guidance_req_queue.put_nowait((d.time, None, x_land, t_elapsed))
+            guidance_is_busy = True
+            last_guidance_time = d.time
+        except mp.queues.Full:
+            pass
+
+    # 3. Low-Level Tracking MPC update (40 Hz)
     if d.time - last_tracker_time >= 0.025:
         gyro_accumulator.clear()  # reset gyro accumulator for next period
         
-        # Sample the interpolated 13D trajectory over preview horizon
-        traj_ref_13d = planner.get_reference_trajectory(
-            d.time,
-            guidance_plan_start_time,
-            N_low=tracker.N,
-            dt_low=tracker.dt
-        )
-        
+        # Sample the continuous interpolated trajectory over tracking preview horizon
+        if latest_trajectory is not None:
+            traj_ref_13d = latest_trajectory.sample_13d(
+                d.time,
+                N_low=tracker.N,
+                dt_low=tracker.dt
+            )
+        else:
+            # Upright hover default while waiting for initial plan
+            traj_ref_13d = np.zeros((13, tracker.N + 1))
+            traj_ref_13d[:3, :] = np.array([x_current_6d[0], x_current_6d[1], x_current_6d[2]])[:, None]
+            traj_ref_13d[6, :] = 1.0  # qw = 1.0
+            
         # Update current reference setpoint for visual telemetry
         x_target = traj_ref_13d[:3, 0].tolist()
         
@@ -184,7 +229,7 @@ def controller1(m, d):
         t_track_loop = time.perf_counter() - t_track_start
         last_tracker_time = d.time
 
-    # 3. Touchdown & Landing Evaluation
+    # 4. Touchdown & Landing Evaluation
     if pz < ground_clearance + 0.05:
         vel_mag = np.linalg.norm([vx, vy, vz])
         if not engine_cut:
@@ -195,7 +240,7 @@ def controller1(m, d):
             else:
                 print(f"Landing alert: Touchdown velocity: {vel_mag:.2f} m/s.")
 
-    # 4. Actuation
+    # 5. Actuation
     if engine_cut:
         d.ctrl[0] = 0.0
         d.ctrl[1] = 0.0
@@ -462,5 +507,15 @@ def main():
             if time_until_next_step > 0:
                 time.sleep(time_until_next_step)
 
+    # Clean shutdown of guidance worker process
+    if guidance_req_queue is not None:
+        try:
+            guidance_req_queue.put(None)
+        except Exception:
+            pass
+    if worker_process is not None and worker_process.is_alive():
+        worker_process.terminate()
+
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     main()

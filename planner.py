@@ -2,6 +2,93 @@ import casadi as ca
 import numpy as np
 from scipy.interpolate import interp1d
 
+
+class GuidanceTrajectory:
+    """
+    Encapsulates the continuous optimal guidance solution as cubic splines.
+    This object is picklable and lightweight to transfer across multiprocessing queues.
+    """
+    def __init__(self, interp_X, interp_U, T_f_sol, t_plan_start=0.0):
+        self.interp_X = interp_X
+        self.interp_U = interp_U
+        self.T_f_sol = float(T_f_sol)
+        self.t_plan_start = float(t_plan_start)
+
+    def sample_state_6d(self, t_rel):
+        """Samples 6D state [px, py, pz, vx, vy, vz] at relative time t_rel from plan start."""
+        t_clamped = float(np.clip(t_rel, 0.0, self.T_f_sol))
+        return self.interp_X(t_clamped)
+
+    def sample_control_3d(self, t_rel):
+        """Samples 3D control force [Fx, Fy, Fz] at relative time t_rel from plan start."""
+        t_clamped = float(np.clip(t_rel, 0.0, self.T_f_sol))
+        return self.interp_U(t_clamped)
+
+    def sample_13d(self, t_sim, N_low=15, dt_low=0.1):
+        """
+        Samples the planned trajectory over the low-level preview window
+        [t_sim, t_sim + N_low * dt_low] and synthesizes 13D reference states.
+        
+        Returns:
+            traj_13d: 2D numpy array of shape (13, N_low + 1)
+        """
+        t_preview = (t_sim - self.t_plan_start) + np.arange(N_low + 1) * dt_low
+        t_preview_clamped = np.clip(t_preview, 0.0, self.T_f_sol)
+        
+        # Interpolate 6D state (px, py, pz, vx, vy, vz)
+        X_preview = self.interp_X(t_preview_clamped)  # (6, N_low + 1)
+        
+        # Interpolate 3D control force (Fx, Fy, Fz)
+        U_preview = self.interp_U(t_preview_clamped)  # (3, N_low + 1)
+        
+        traj_13d = np.zeros((13, N_low + 1))
+        # Position and velocity
+        traj_13d[:6, :] = X_preview
+        
+        # Synthesize attitude quaternion from thrust direction
+        for j in range(N_low + 1):
+            F = U_preview[:, j]
+            f_norm = np.linalg.norm(F)
+            if f_norm > 1e-3:
+                u_dir = F / f_norm  # Unit thrust vector in world frame
+            else:
+                u_dir = np.array([0.0, 0.0, 1.0])
+                
+            # Rocket longitudinal axis is +Z in body frame.
+            # We want body +Z to align with desired thrust direction u_dir.
+            # Axis of rotation: a = z_hat x u_dir = [-u_y, u_x, 0]
+            z_hat = np.array([0.0, 0.0, 1.0])
+            u_z = np.clip(u_dir[2], -1.0, 1.0)
+            
+            if u_z > 0.9999:
+                # Perfectly upright
+                q_ref = np.array([1.0, 0.0, 0.0, 0.0])
+            elif u_z < -0.9999:
+                # Inverted (tilt 180 deg around X)
+                q_ref = np.array([0.0, 1.0, 0.0, 0.0])
+            else:
+                angle = np.arccos(u_z)
+                axis = np.array([-u_dir[1], u_dir[0], 0.0])
+                axis_norm = np.linalg.norm(axis)
+                if axis_norm > 1e-6:
+                    axis = axis / axis_norm
+                    half_angle = angle / 2.0
+                    q_ref = np.array([
+                        np.cos(half_angle),
+                        axis[0] * np.sin(half_angle),
+                        axis[1] * np.sin(half_angle),
+                        axis[2] * np.sin(half_angle)
+                    ])
+                else:
+                    q_ref = np.array([1.0, 0.0, 0.0, 0.0])
+                    
+            traj_13d[6:10, j] = q_ref
+            # Angular velocity reference omega = [0, 0, 0]
+            traj_13d[10:13, j] = 0.0
+    
+        return traj_13d
+
+
 class MPCPlanner:
     def __init__(self, N=40, alpha=1.0, beta=1.0, gamma=1.0, ground_clearance=0.5):
         self.N = N
@@ -19,6 +106,8 @@ class MPCPlanner:
         R_base = np.diag([1.0, 1.0, 0.05])
         # Control rate: [dFx, dFy, dFz]
         S_base = np.diag([0.2, 0.2, 0.02])
+
+        vertical_W = np.diag([1.0,1.0])
         
         # Scaled weights
         w_T = 2.0 * alpha          # Time penalty weight
@@ -80,11 +169,10 @@ class MPCPlanner:
             self.opti.subject_to(self.X[2, k] >= self.ground_clearance)
             
             # Velocity-altitude glide slope (forces slower descent near the ground)
-            # vz >= -0.6 * pz - 0.2 (max 0.2 m/s descent at touchdown, linearly scaling with altitude)
             self.opti.subject_to(self.X[5, k] >= -0.6 * (self.X[2, k] - self.ground_clearance) - 0.2)
             eps = 1e-6
-            self.opti.subject_to(ca.sqrt(self.X[4, k]**2 + eps) <= 0.6 * self.X[1, k] + 0.1)
-            self.opti.subject_to(ca.sqrt(self.X[3, k]**2 + eps) <= 0.6 * self.X[0, k] + 0.1)
+            self.opti.subject_to(ca.sqrt(self.X[4, k]**2 + eps) <= 0.2 * self.X[1, k] + 0.1)
+            self.opti.subject_to(ca.sqrt(self.X[3, k]**2 + eps) <= 0.2 * self.X[0, k] + 0.1)
             
             # Control constraints
             F_k = self.U[:, k]
@@ -99,6 +187,9 @@ class MPCPlanner:
             if k > 0:
                 du = self.U[:, k] - self.U[:, k-1]
                 cost += ca.mtimes([du.T, S, du])
+
+            dxdy = self.X[:2,k] - self.x_ref[:2]
+            cost += 0.25* ca.mtimes([dxdy.T, vertical_W, dxdy])
                 
         # Terminal altitude constraint
         self.opti.subject_to(self.X[2, N] >= self.ground_clearance)
@@ -135,7 +226,7 @@ class MPCPlanner:
         self.has_solution = False
 
     def estimate_time_to_go(self, x_current, x_target):
-        """Analytical time-to-go estimate used for initial warm starting."""
+        """Analytical time-to-go estimate used ONLY for initial warm starting without prior plan."""
         p_curr = np.asarray(x_current[:3], dtype=float)
         v_curr = np.asarray(x_current[3:6], dtype=float)
         p_tgt = np.asarray(x_target[:3], dtype=float)
@@ -154,23 +245,62 @@ class MPCPlanner:
         t_final_est = max(t_est, t_z)
         return float(np.clip(t_final_est, 1.0, 25.0))
 
-    def solve(self, x_current, x_target):
+    def sample_previous_solution(self, t_rel):
+        """Samples the 6D state from the previous optimal trajectory at relative time t_rel."""
+        if not self.has_solution or self.X_sol is None:
+            return None
+        t_clamped = float(np.clip(t_rel, 0.0, self.T_f_sol))
+        interp_X = interp1d(self.t_grid_sol, self.X_sol, axis=1, kind='cubic', fill_value="extrapolate")
+        return interp_X(t_clamped)
+
+    def _build_guidance_trajectory(self, t_plan_start=0.0):
+        """Constructs and returns a GuidanceTrajectory object from current solution arrays."""
+        interp_X = interp1d(self.t_grid_sol, self.X_sol, axis=1, kind='cubic', fill_value="extrapolate")
+        t_u_grid = self.t_grid_sol[:-1]
+        interp_U = interp1d(t_u_grid, self.U_sol, axis=1, kind='cubic', fill_value="extrapolate")
+        return GuidanceTrajectory(interp_X, interp_U, self.T_f_sol, t_plan_start=t_plan_start)
+
+    def solve(self, x_current, x_target, t_elapsed=None, t_plan_start=0.0):
         """
         Solves the free final time guidance NLP.
+        Parameters:
+            x_current:   Initial 6D state (used if no previous solution or t_elapsed is None)
+            x_target:    Target landing 6D state
+            t_elapsed:   Time elapsed (T_s,p) since previous plan start. If provided and a previous
+                         solution exists, initial state is constrained to x*(T_s,p) from previous optimal
+                         trajectory and horizon is shortened.
+            t_plan_start: Simulation timestamp when this plan was initiated.
         Returns:
-            t_grid: 1D numpy array of shape (N+1,) with timestamps from 0 to T_f
-            X_sol:  2D numpy array of shape (6, N+1)
-            U_sol:  2D numpy array of shape (3, N)
-            T_f_sol: float, optimal landing duration
+            trajectory: GuidanceTrajectory object with continuous interpolation functions and sampler
+            T_f_sol:    float, optimal landing duration
         """
-        x_curr_arr = np.asarray(x_current, dtype=float).flatten()[:6]
         x_tgt_arr = np.asarray(x_target, dtype=float).flatten()[:6]
-        
-        self.opti.set_value(self.x_init, x_curr_arr)
         self.opti.set_value(self.x_ref, x_tgt_arr)
         
         # Warm start initial guesses
-        if not self.has_solution:
+        if self.has_solution and t_elapsed is not None:
+            # 1. Constrain initial state to point x*(T_s,p) from previous step's optimal trajectory
+            x_curr_arr = self.sample_previous_solution(t_elapsed)
+            self.opti.set_value(self.x_init, x_curr_arr)
+            
+            # 2. Shorten the active optimization horizon: warm start with T_f - T_s,p
+            t_warm = max(0.5, self.T_f_sol - float(t_elapsed))
+            self.opti.set_initial(self.T_f, t_warm)
+            
+            # Warm start state and control trajectories from previous solution
+            t_interp = np.linspace(float(t_elapsed), self.T_f_sol, self.N + 1)
+            interp_X = interp1d(self.t_grid_sol, self.X_sol, axis=1, kind='cubic', fill_value="extrapolate")
+            self.opti.set_initial(self.X, interp_X(t_interp))
+            
+            t_u_grid = self.t_grid_sol[:-1]
+            interp_U = interp1d(t_u_grid, self.U_sol, axis=1, kind='cubic', fill_value="extrapolate")
+            t_u_interp = np.linspace(float(t_elapsed), self.T_f_sol, self.N)
+            self.opti.set_initial(self.U, interp_U(t_u_interp))
+        else:   
+            # Initial solve without previous solution: construct full horizon with x_current
+            x_curr_arr = np.asarray(x_current, dtype=float).flatten()[:6]
+            self.opti.set_value(self.x_init, x_curr_arr)
+
             t_init = self.estimate_time_to_go(x_curr_arr, x_tgt_arr)
             self.opti.set_initial(self.T_f, t_init)
             
@@ -184,11 +314,6 @@ class MPCPlanner:
             U_init = np.zeros((3, self.N))
             U_init[2, :] = self.m * self.g
             self.opti.set_initial(self.U, U_init)
-        else:
-            # Warm start from previous solution
-            self.opti.set_initial(self.T_f, self.T_f_sol)
-            self.opti.set_initial(self.X, self.X_sol)
-            self.opti.set_initial(self.U, self.U_sol)
             
         try:
             sol = self.opti.solve()
@@ -197,7 +322,7 @@ class MPCPlanner:
             self.U_sol = np.array(sol.value(self.U))
             self.t_grid_sol = np.linspace(0.0, self.T_f_sol, self.N + 1)
             self.has_solution = True
-            return self.t_grid_sol, self.X_sol, self.U_sol, self.T_f_sol
+            return self._build_guidance_trajectory(t_plan_start=t_plan_start), self.T_f_sol
         except Exception as e:
             print(f"Guidance MPC failed to solve: {e}")
             if not self.has_solution:
@@ -210,77 +335,43 @@ class MPCPlanner:
                     self.X_sol[i, :] = np.linspace(x_curr_arr[i], x_tgt_arr[i], self.N + 1)
                 self.U_sol = np.zeros((3, self.N))
                 self.U_sol[2, :] = self.m * self.g
-            return self.t_grid_sol, self.X_sol, self.U_sol, self.T_f_sol
+            return self._build_guidance_trajectory(t_plan_start=t_plan_start), self.T_f_sol
 
     def get_reference_trajectory(self, t_sim, t_plan_start, N_low=15, dt_low=0.1):
         """
-        Samples the latest planned trajectory over the low-level preview window
-        [t_sim, t_sim + N_low * dt_low] and synthesizes 13D reference states.
-        
-        Returns:
-            traj_13d: 2D numpy array of shape (13, N_low + 1)
+        Samples the latest planned trajectory over the low-level preview window.
+        Provided for backwards compatibility; returns 13D reference matrix (13, N_low + 1).
         """
         if not self.has_solution or self.X_sol is None:
-            # Return upright hover default if no plan exists
             traj_13d = np.zeros((13, N_low + 1))
             traj_13d[6, :] = 1.0  # qw = 1.0 (upright)
             return traj_13d
-            
-        t_preview = t_sim - t_plan_start + np.arange(N_low + 1) * dt_low
-        t_preview_clamped = np.clip(t_preview, 0.0, self.T_f_sol)
-        
-        # Interpolate 6D state (px, py, pz, vx, vy, vz)
-        interp_X = interp1d(self.t_grid_sol, self.X_sol, axis=1, kind='cubic', fill_value="extrapolate")
-        X_preview = interp_X(t_preview_clamped)  # (6, N_low + 1)
-        
-        # Interpolate 3D control force (Fx, Fy, Fz)
-        t_u_grid = self.t_grid_sol[:-1]
-        interp_U = interp1d(t_u_grid, self.U_sol, axis=1, kind='cubic', fill_value="extrapolate")
-        U_preview = interp_U(t_preview_clamped)  # (3, N_low + 1)
-        
-        traj_13d = np.zeros((13, N_low + 1))
-        # Position and velocity
-        traj_13d[:6, :] = X_preview
-        
-        # Synthesize attitude quaternion from thrust direction
-        for j in range(N_low + 1):
-            F = U_preview[:, j]
-            f_norm = np.linalg.norm(F)
-            if f_norm > 1e-3:
-                u_dir = F / f_norm  # Unit thrust vector in world frame
-            else:
-                u_dir = np.array([0.0, 0.0, 1.0])
-                
-            # Rocket longitudinal axis is +Z in body frame.
-            # We want body +Z to align with desired thrust direction u_dir.
-            # Axis of rotation: a = z_hat x u_dir = [-u_y, u_x, 0]
-            z_hat = np.array([0.0, 0.0, 1.0])
-            u_z = np.clip(u_dir[2], -1.0, 1.0)
-            
-            if u_z > 0.9999:
-                # Perfectly upright
-                q_ref = np.array([1.0, 0.0, 0.0, 0.0])
-            elif u_z < -0.9999:
-                # Inverted (tilt 180 deg around X)
-                q_ref = np.array([0.0, 1.0, 0.0, 0.0])
-            else:
-                angle = np.arccos(u_z)
-                axis = np.array([-u_dir[1], u_dir[0], 0.0])
-                axis_norm = np.linalg.norm(axis)
-                if axis_norm > 1e-6:
-                    axis = axis / axis_norm
-                    half_angle = angle / 2.0
-                    q_ref = np.array([
-                        np.cos(half_angle),
-                        axis[0] * np.sin(half_angle),
-                        axis[1] * np.sin(half_angle),
-                        axis[2] * np.sin(half_angle)
-                    ])
-                else:
-                    q_ref = np.array([1.0, 0.0, 0.0, 0.0])
-                    
-            traj_13d[6:10, j] = q_ref
-            # Angular velocity reference omega = [0, 0, 0]
-            traj_13d[10:13, j] = 0.0
-            
-        return traj_13d
+        traj = self._build_guidance_trajectory(t_plan_start=t_plan_start)
+        return traj.sample_13d(t_sim, N_low=N_low, dt_low=dt_low)
+
+
+def guidance_worker_loop(req_queue, res_queue, planner_config):
+    """
+    Dedicated worker process loop for the Guidance MPC solver.
+    Instantiates the CasADi/IPOPT planner in its own isolated process space.
+    """
+    planner = MPCPlanner(**planner_config)
+    while True:
+        try:
+            req = req_queue.get()
+            if req is None:
+                break
+            t_req, x_init, x_target, t_elapsed = req
+            traj, t_final_val = planner.solve(
+                x_current=x_init,
+                x_target=x_target,
+                t_elapsed=t_elapsed,
+                t_plan_start=t_req
+            )
+            res_queue.put({
+                "t_req": t_req,
+                "trajectory": traj,
+                "t_final": t_final_val
+            })
+        except Exception as e:
+            print(f"[Guidance Worker Error] {e}")
