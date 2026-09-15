@@ -90,7 +90,7 @@ class GuidanceTrajectory:
 
 
 class MPCPlanner:
-    def __init__(self, N=40, alpha=1.0, beta=1.0, gamma=1.0, ground_clearance=0.5):
+    def __init__(self, N=40, alpha=1.0, beta=1.0, gamma=1.0, ground_clearance=0.5, mass=1.05):
         self.N = N
         self.alpha = alpha
         self.beta = beta
@@ -98,7 +98,7 @@ class MPCPlanner:
         self.ground_clearance = ground_clearance
         
         # Physical parameters
-        self.m = 1.05       # mass (kg)
+        self.m = mass       # mass (kg)
         self.g = 9.81       # gravity (m/s^2)
         
         # Base weight matrices
@@ -124,13 +124,6 @@ class MPCPlanner:
         u = ca.MX.sym('u', 3)
         Fx, Fy, Fz = u[0], u[1], u[2]
         
-        # State derivatives
-        x_dot = ca.vertcat(
-            vx, vy, vz,
-            Fx / self.m, Fy / self.m, Fz / self.m - self.g
-        )
-        f_cont = ca.Function('f_cont', [x, u], [x_dot])
-        
         # Problem formulation
         self.opti = ca.Opti()
         
@@ -142,6 +135,16 @@ class MPCPlanner:
         # Parameters
         self.x_init = self.opti.parameter(6)
         self.x_ref = self.opti.parameter(6)
+        self.m_param = self.opti.parameter()
+        self.opti.set_value(self.m_param, self.m)
+        
+        # State derivatives
+        m_sym = ca.MX.sym('m_sym')
+        x_dot = ca.vertcat(
+            vx, vy, vz,
+            Fx / m_sym, Fy / m_sym, Fz / m_sym - self.g
+        )
+        f_cont = ca.Function('f_cont', [x, u, m_sym], [x_dot])
         
         # Variable time step dt = T_f / N
         dt = self.T_f / N
@@ -156,10 +159,10 @@ class MPCPlanner:
         
         for k in range(N):
             # RK4 Integration with symbolic dt = T_f / N
-            k1 = f_cont(self.X[:, k], self.U[:, k])
-            k2 = f_cont(self.X[:, k] + dt/2 * k1, self.U[:, k])
-            k3 = f_cont(self.X[:, k] + dt/2 * k2, self.U[:, k])
-            k4 = f_cont(self.X[:, k] + dt * k3, self.U[:, k])
+            k1 = f_cont(self.X[:, k], self.U[:, k], self.m_param)
+            k2 = f_cont(self.X[:, k] + dt/2 * k1, self.U[:, k], self.m_param)
+            k3 = f_cont(self.X[:, k] + dt/2 * k2, self.U[:, k], self.m_param)
+            k4 = f_cont(self.X[:, k] + dt * k3, self.U[:, k], self.m_param)
             x_next = self.X[:, k] + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
             
             # Dynamics constraint
@@ -260,20 +263,26 @@ class MPCPlanner:
         interp_U = interp1d(t_u_grid, self.U_sol, axis=1, kind='cubic', fill_value="extrapolate")
         return GuidanceTrajectory(interp_X, interp_U, self.T_f_sol, t_plan_start=t_plan_start)
 
-    def solve(self, x_current, x_target, t_elapsed=None, t_plan_start=0.0):
+    def solve(self, x_current, x_target, t_elapsed=None, t_plan_start=0.0, current_mass=None):
         """
-        Solves the free final time guidance NLP.
-        Parameters:
-            x_current:   Initial 6D state (used if no previous solution or t_elapsed is None)
+        Solves the free-final-time point-mass trajectory optimization problem.
+        
+        Args:
+            x_current:   Current 6D state feedback [px, py, pz, vx, vy, vz].
+                         If None and warm starting, samples from previous optimal trajectory.
             x_target:    Target landing 6D state
             t_elapsed:   Time elapsed (T_s,p) since previous plan start. If provided and a previous
                          solution exists, initial state is constrained to x*(T_s,p) from previous optimal
                          trajectory and horizon is shortened.
             t_plan_start: Simulation timestamp when this plan was initiated.
+            current_mass: Real-time vehicle mass (kg). If None, uses self.m.
         Returns:
             trajectory: GuidanceTrajectory object with continuous interpolation functions and sampler
             T_f_sol:    float, optimal landing duration
         """
+        m_val = float(current_mass) if current_mass is not None else self.m
+        self.opti.set_value(self.m_param, m_val)
+
         x_tgt_arr = np.asarray(x_target, dtype=float).flatten()[:6]
         self.opti.set_value(self.x_ref, x_tgt_arr)
         
@@ -312,7 +321,7 @@ class MPCPlanner:
             
             # Hover thrust guess
             U_init = np.zeros((3, self.N))
-            U_init[2, :] = self.m * self.g
+            U_init[2, :] = m_val * self.g
             self.opti.set_initial(self.U, U_init)
             
         try:
@@ -334,7 +343,7 @@ class MPCPlanner:
                 for i in range(6):
                     self.X_sol[i, :] = np.linspace(x_curr_arr[i], x_tgt_arr[i], self.N + 1)
                 self.U_sol = np.zeros((3, self.N))
-                self.U_sol[2, :] = self.m * self.g
+                self.U_sol[2, :] = m_val * self.g
             return self._build_guidance_trajectory(t_plan_start=t_plan_start), self.T_f_sol
 
     def get_reference_trajectory(self, t_sim, t_plan_start, N_low=15, dt_low=0.1):
@@ -361,12 +370,17 @@ def guidance_worker_loop(req_queue, res_queue, planner_config):
             req = req_queue.get()
             if req is None:
                 break
-            t_req, x_init, x_target, t_elapsed = req
+            if len(req) == 5:
+                t_req, x_init, x_target, t_elapsed, current_mass = req
+            else:    # TODO delete this, current_mass=None will throw error
+                t_req, x_init, x_target, t_elapsed = req
+                current_mass = None
             traj, t_final_val = planner.solve(
                 x_current=x_init,
                 x_target=x_target,
                 t_elapsed=t_elapsed,
-                t_plan_start=t_req
+                t_plan_start=t_req,
+                current_mass=current_mass
             )
             res_queue.put({
                 "t_req": t_req,

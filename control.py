@@ -2,17 +2,19 @@ import casadi as ca
 import numpy as np
 
 class MPCController:
-    def __init__(self, N=20, dt=0.1, alpha=1.0, beta=1.0, gamma=1.0, ground_clearance=0.5):
+    def __init__(self, N=20, dt=0.1, alpha=1.0, beta=1.0, gamma=1.0, ground_clearance=0.5, mass=1.05):
         self.N = N
         self.dt = dt
         self.ground_clearance = ground_clearance
+        self.mass = mass
         
         # Physical parameters
-        m = 1.05       # mass (kg)
+        m = mass       # mass (kg)
         g = 9.81       # gravity (m/s^2)
-        Jx = 0.0875    # moment of inertia x (kg*m^2)
-        Jy = 0.0875    # moment of inertia y (kg*m^2)
-        Jz = 0.00525   # moment of inertia z (kg*m^2)
+        # Moments of inertia scale proportionally with mass for the rocket geometry
+        Jx = 0.0875 * (mass / 1.05)    # moment of inertia x (kg*m^2)
+        Jy = 0.0875 * (mass / 1.05)    # moment of inertia y (kg*m^2)
+        Jz = 0.00525 * (mass / 1.05)   # moment of inertia z (kg*m^2)
         L_cg = 0.5     # distance from CoM to gimbal (m)
         
         # Base weight matrices
@@ -70,9 +72,14 @@ class MPCController:
             ca.horzcat(2.0*(qx*qz - qw*qy),       2.0*(qy*qz + qw*qx),       1.0 - 2.0*(qx**2 + qy**2))
         )
         
+        m_sym = ca.MX.sym('m_sym')
+        Jx_sym = 0.0875 * (m_sym / 1.05)
+        Jy_sym = 0.0875 * (m_sym / 1.05)
+        Jz_sym = 0.00525 * (m_sym / 1.05)
+        
         # World thrust and acceleration
         f_world = ca.mtimes(R_b2w, f_body)
-        a_world = f_world / m + ca.vertcat(0, 0, -g)
+        a_world = f_world / m_sym + ca.vertcat(0, 0, -g)
         
         # Quaternion kinematics: q_dot = 0.5 * q (x) [0, omega]
         qw_dot = 0.5 * (-qx*wx - qy*wy - qz*wz)
@@ -81,9 +88,9 @@ class MPCController:
         qz_dot = 0.5 * ( qw*wz + qx*wy - qy*wx)
         
         # Angular accelerations (Euler's equations for rigid body)
-        wx_dot = (tau_x - (Jz - Jy) * wy * wz) / Jx
-        wy_dot = (tau_y - (Jx - Jz) * wz * wx) / Jy
-        wz_dot = (tau_z - (Jy - Jx) * wx * wy) / Jz
+        wx_dot = (tau_x - (Jz_sym - Jy_sym) * wy * wz) / Jx_sym
+        wy_dot = (tau_y - (Jx_sym - Jz_sym) * wz * wx) / Jy_sym
+        wz_dot = (tau_z - (Jy_sym - Jx_sym) * wx * wy) / Jz_sym
         
         # State derivatives
         x_dot = ca.vertcat(
@@ -94,16 +101,16 @@ class MPCController:
         )
         
         # Continuous dynamics function
-        f_cont = ca.Function('f_cont', [x, u], [x_dot])
+        f_cont = ca.Function('f_cont', [x, u, m_sym], [x_dot])
         
         # RK4 discretization
-        k1 = f_cont(x, u)
-        k2 = f_cont(x + dt/2 * k1, u)
-        k3 = f_cont(x + dt/2 * k2, u)
-        k4 = f_cont(x + dt * k3, u)
+        k1 = f_cont(x, u, m_sym)
+        k2 = f_cont(x + dt/2 * k1, u, m_sym)
+        k3 = f_cont(x + dt/2 * k2, u, m_sym)
+        k4 = f_cont(x + dt * k3, u, m_sym)
         x_next = x + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
         
-        f_discrete = ca.Function('f_discrete', [x, u], [x_next])
+        f_discrete = ca.Function('f_discrete', [x, u, m_sym], [x_next])
         
         # Problem formulation
         self.opti = ca.Opti()
@@ -113,11 +120,12 @@ class MPCController:
         
         self.x_init = self.opti.parameter(13)
         self.X_ref = self.opti.parameter(13, N+1)
+        self.m_param = self.opti.parameter()
         
         cost = 0
         for k in range(N):
             # Dynamics constraints
-            self.opti.subject_to(self.X[:, k+1] == f_discrete(self.X[:, k], self.U[:, k]))
+            self.opti.subject_to(self.X[:, k+1] == f_discrete(self.X[:, k], self.U[:, k], self.m_param))
             
             # State constraints: pz >= ground_clearance (rocket center of mass height on ground)
             self.opti.subject_to(self.X[2, k+1] >= self.ground_clearance)
@@ -173,14 +181,15 @@ class MPCController:
 
         self.solve_fn = self.opti.to_function(
             'mpc_step',
-            [self.x_init, self.X_ref, self.opti.x, self.opti.lam_g],
+            [self.x_init, self.X_ref, self.m_param, self.opti.x, self.opti.lam_g],
             [self.U[:, 0], self.opti.x, self.opti.lam_g]
         )
         self.primal_guess = np.zeros(self.opti.x.shape[0])
         self.dual_guess = np.zeros(self.opti.lam_g.shape[0])
         self.u_prev = (m * g, 0.0, 0.0)  # Default hover thrust fallback
 
-    def solve(self, x_current, traj_ref):
+    def solve(self, x_current, traj_ref, current_mass=None):
+        m_val = float(current_mass) if current_mass is not None else self.mass
         try:
             # Handle both single state (13,) and trajectory matrix (13, N+1) or (N+1, 13)
             traj_arr = np.asarray(traj_ref, dtype=float)
@@ -196,7 +205,7 @@ class MPCController:
 
             # solve_fn evaluates the compiled NLP graph and updates primal/dual warm starts
             u0, self.primal_guess, self.dual_guess = self.solve_fn(
-                x_current, traj_mat, self.primal_guess, self.dual_guess
+                x_current, traj_mat, m_val, self.primal_guess, self.dual_guess
             )
             self.u_prev = (float(u0[0]), float(u0[1]), float(u0[2]))
             return self.u_prev

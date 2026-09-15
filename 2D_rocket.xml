@@ -24,7 +24,7 @@
         <joint name="slosh_x" type="slide" axis="1 0 0" stiffness="25" damping="0.3" limited="true" range="-0.15 0.15"/>
         <body name="slosh_mass_xy" pos="0 0 0">
           <joint name="slosh_y" type="slide" axis="0 1 0" stiffness="25" damping="0.3" limited="true" range="-0.15 0.15"/>
-          <geom type="sphere" size="0.08" rgba="0.2 0.4 0.9 0.9" mass="0.25" contype="0" conaffinity="0"/>
+          <geom type="sphere" size="0.08" rgba="0.2 0.4 0.9 0.9" mass="0.2" contype="0" conaffinity="0"/>
         </body>
       </body>
 
@@ -45,8 +45,12 @@
     <magnetometer name="body_mag" site="imu_site"/>
   </sensor>
   <actuator>
-    <position joint="gimbal_x" kp="50" ctrlrange="-0.26 0.26" ctrllimited="true"/>
-    <position joint="gimbal_y" kp="50" ctrlrange="-0.26 0.26" ctrllimited="true"/>
-    <motor site="thrust_site" gear="0 0 1 0 0 0" forcerange="0 20" forcelimited="true"/>
+    <position joint="gimbal_x" 
+              kp="50" 
+              ctrlrange="-0.26 0.26" 
+              ctrllimited="true" 
+              timeconst="0.05"/>
+    <position joint="gimbal_y" kp="50" ctrlrange="-0.26 0.26" timeconst="0.05"/>
+    <general site="thrust_site" gear="0 0 1 0 0 0" forcerange="0 20" forcelimited="true" dyntype="filter" dynprm="0.2" gainprm="1" biasprm="0 0 0"/>
   </actuator>
 </mujoco>

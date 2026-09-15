@@ -29,6 +29,12 @@ gps_frequency = 10.0
 steps_per_render = int((1.0 / render_fps) / physics_dt)
 steps_per_gps = int((1.0 / gps_frequency) / physics_dt)
 
+# Propellant Depletion & Variable Mass Settings
+ENABLE_FUEL_DEPLETION = True
+ISP = 120.0             # Specific impulse in seconds (fuel burn rate: dm = F / (ISP * g0) * dt)
+MIN_SLOSH_MASS = 0.005  # Residual dry slosh floor (kg)
+G0 = 9.81               # Standard gravity constant (m/s^2)
+
 def load_model():
     if not os.path.exists(XML_PATH):
         raise FileNotFoundError(f"XML file not found at: {XML_PATH}")
@@ -60,16 +66,18 @@ landing_evaluated = False
 
 def init_controller(m, d):
     global mpc, x_target, current_thrust, waypoints
-    mpc = MPCController(N=20, dt=0.1, alpha=0.24, beta=0.04, gamma=3.12)
+    total_mass = float(np.sum(m.body_mass))
+    mpc = MPCController(N=20, dt=0.1, alpha=0.24, beta=0.04, gamma=3.12, mass=total_mass)
     # Target state (13D): [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz]
     x_target = [2.0, 2.0, 10.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     waypoints = []
 
-    current_thrust = -m.opt.gravity[2] * 1.05 # setpoint thrust
+    current_thrust = -m.opt.gravity[2] * total_mass # setpoint thrust
 
 def init_trajectory_controller(m, d):
     global mpc, x_target, current_thrust, waypoints, current_waypoint_index, waypoint_arrival_time
-    mpc = MPCController(N=15, dt=0.1, alpha=16.68276963291755, beta=0.5843884594990272, gamma=4.485854411546921)
+    total_mass = float(np.sum(m.body_mass))
+    mpc = MPCController(N=15, dt=0.1, alpha=16.68276963291755, beta=0.5843884594990272, gamma=4.485854411546921, mass=total_mass)
     
     waypoints = [
         [2.0, 0.0, 15.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],  # Up and to the right
@@ -80,7 +88,7 @@ def init_trajectory_controller(m, d):
     x_target = [d.qpos[0], d.qpos[1], d.qpos[2], 0.0, 0.0, 0.0, d.qpos[3], d.qpos[4], d.qpos[5], d.qpos[6], 0.0, 0.0, 0.0] # initial pos
     waypoint_arrival_time = None
     
-    current_thrust = -m.opt.gravity[2] * 1.05
+    current_thrust = -m.opt.gravity[2] * total_mass
 
 def initialize_controller1(m, d):
     """
@@ -97,6 +105,8 @@ def initialize_controller1(m, d):
     rocket_body_id = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "rocket")
     geom_id = m.body_geomadr[rocket_body_id]
     ground_clearance = float(m.geom_size[geom_id, 1]) + 0.25
+
+    total_mass = float(np.sum(m.body_mass))
     
     guidance_req_queue = mp.Queue(maxsize=1)
     guidance_res_queue = mp.Queue(maxsize=1)
@@ -108,7 +118,8 @@ def initialize_controller1(m, d):
         "alpha": 1.0,
         "beta": 1.0,
         "gamma": 1.0,
-        "ground_clearance": ground_clearance
+        "ground_clearance": ground_clearance,
+        "mass": total_mass
     }
     worker_process = mp.Process(
         target=guidance_worker_loop,
@@ -117,12 +128,21 @@ def initialize_controller1(m, d):
     )
     worker_process.start()
     
-    tracker = MPCController(N=15, dt=0.1, alpha=16.68276963291755, beta=0.5843884594990272, gamma=4.485854411546921, ground_clearance=ground_clearance)
+    
+    tracker = MPCController(
+        N=15,
+        dt=0.1,
+        alpha=16.68276963291755,
+        beta=0.5843884594990272,
+        gamma=4.485854411546921,
+        ground_clearance=ground_clearance,
+        mass=total_mass
+    )
     
     # Target landing state (6D): [px, py, pz, vx, vy, vz]
     x_land = [0.0, 0.0, ground_clearance, 0.0, 0.0, 0.0]
     
-    current_thrust = -m.opt.gravity[2] * 1.05
+    current_thrust = -m.opt.gravity[2] * total_mass
     current_gimbal_x = 0.0
     current_gimbal_y = 0.0
     
@@ -135,10 +155,10 @@ def initialize_controller1(m, d):
 
     # Trigger initial guidance plan request
     x_init_6d = [d.qpos[0], d.qpos[1], d.qpos[2], 0.0, 0.0, 0.0]
-    guidance_req_queue.put((d.time, x_init_6d, x_land, None))
+    guidance_req_queue.put((d.time, x_init_6d, x_land, None, total_mass))
     guidance_is_busy = True
     last_guidance_time = d.time
-    print("Initialized 2-Level Controller: High-Level Async Guidance Worker + Low-Level Tracker MPC.")
+    print("Initialized 2-Level Controller: High-Level Guidance + Low-Level Tracker MPC. Running in parallel processes.")
 
 def controller1(m, d):
     """
@@ -152,6 +172,7 @@ def controller1(m, d):
     global guidance_req_queue, guidance_res_queue, latest_trajectory, guidance_is_busy
 
     # Extract state feedback from MEKF or ground truth
+    current_total_mass = float(np.sum(m.body_mass))
     if use_mekf and mekf is not None:
         px, py, pz = float(mekf.pos[0]), float(mekf.pos[1]), float(mekf.pos[2])
         vx, vy, vz = float(mekf.vel[0]), float(mekf.vel[1]), float(mekf.vel[2])
@@ -189,7 +210,7 @@ def controller1(m, d):
             t_final_current = res["t_final"]
             guidance_is_busy = False
             lag_ms = (d.time - res["t_req"]) * 1000.0
-            print(f"[Async Guidance] Received plan at t={d.time:.2f}s | Tf*={t_final_current:.2f}s | Solve lag={lag_ms:.1f}ms")
+            print(f"[Guidance] Received plan at t={d.time:.2f}s | Tf*={t_final_current:.2f}s | Solve lag={lag_ms:.1f}ms")
         except mp.queues.Empty:
             pass
 
@@ -197,8 +218,8 @@ def controller1(m, d):
     if (d.time - last_guidance_time >= 0.5) and not guidance_is_busy and t_final_current > 3.0:
         t_elapsed = d.time - last_guidance_time
         try:
-            # Open-loop step: send x_init=None so planner samples from previous trajectory
-            guidance_req_queue.put_nowait((d.time, None, x_land, t_elapsed))
+            # Open-loop step: send x_init=None so planner samples from previous trajectory with current mass
+            guidance_req_queue.put_nowait((d.time, None, x_land, t_elapsed, current_total_mass))
             guidance_is_busy = True
             last_guidance_time = d.time
         except mp.queues.Full:
@@ -225,7 +246,9 @@ def controller1(m, d):
         x_target = traj_ref_13d[:3, 0].tolist()
         
         t_track_start = time.perf_counter()
-        current_thrust, current_gimbal_x, current_gimbal_y = tracker.solve(x_current_13d, traj_ref_13d)
+        current_thrust, current_gimbal_x, current_gimbal_y = tracker.solve(
+            x_current_13d, traj_ref_13d, current_mass=current_total_mass
+        )
         t_track_loop = time.perf_counter() - t_track_start
         last_tracker_time = d.time
 
@@ -332,7 +355,9 @@ def controller(m, d):
                 omega_body[0], omega_body[1], omega_body[2]
             ]
         t_mpc_start = time.perf_counter()
-        current_thrust, current_gimbal_x, current_gimbal_y = mpc.solve(x_current, x_target)
+        current_thrust, current_gimbal_x, current_gimbal_y = mpc.solve(
+            x_current, x_target, current_mass=float(np.sum(m.body_mass))
+        )
         t_mpc_loop = time.perf_counter() - t_mpc_start
         print(f"MPC loop time: {t_mpc_loop * 1000:.2f} ms | Max Freq: {1/(t_mpc_loop):.2f} Hz")
         last_mpc_time = d.time
@@ -404,7 +429,15 @@ def main():
     initialize_controller1(m, d)
     mj.set_mjcb_control(controller1)
 
-    # Rerun blueprint (2x3 grid)
+    # Slosh mass identification and setup for propellant depletion
+    slosh_body_id = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "slosh_mass_xy")
+    slosh_dummy_id = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "slosh_dummy_x")
+    initial_slosh_mass = float(m.body_mass[slosh_body_id])
+    current_slosh_mass = initial_slosh_mass
+    # Precomputed sphere inertia factor: I = 2/5 * m * r^2 = 0.4 * (0.08^2) * m = 0.00256 * m
+    sphere_inertia_factor = 0.4 * (0.08 ** 2)
+
+    # Rerun blueprint (3-column layout including mass telemetry)
     common_x = rrb.TimeAxis(
         view_range=rr.TimeRange(
             start=rrb.TimeRangeBoundary.absolute(seq=0),
@@ -423,6 +456,11 @@ def main():
                 rrb.TimeSeriesView(name="Attitude", origin="attitude", axis_x=common_x, axis_y=rrb.ScalarAxis(range=(-0.5, 0.5))),
                 rrb.TimeSeriesView(name="Velocity", origin="velocity", axis_x=common_x, axis_y=rrb.ScalarAxis(range=(-10.0, 10.0))),
                 rrb.TimeSeriesView(name="Controls", origin="control", axis_x=common_x)
+            ),
+            rrb.Vertical(
+                rrb.TimeSeriesView(name="Total Mass (kg)", origin="mass/total", axis_x=common_x, axis_y=rrb.ScalarAxis(range=(0.6, 1.1))),
+                rrb.TimeSeriesView(name="Slosh Propellant (kg)", origin="mass/slosh_propellant", axis_x=common_x, axis_y=rrb.ScalarAxis(range=(0.0, 0.25))),
+                rrb.TimeSeriesView(name="Optimal Time-To-Go", origin="guidance/t_final", axis_x=common_x)
             )
         )
     )
@@ -431,90 +469,120 @@ def main():
     steps_to_render = steps_per_render
     steps_to_gps = steps_per_gps
 
-    with mj.viewer.launch_passive(m, d, show_left_ui=True, show_right_ui=True) as viewer:
-        # startup delay
-        wait_time = 5.0
-        wall_start_time = time.time()
-        print(f"Waiting {wait_time} seconds for you to arrange windows...")
+    try:
+        with mj.viewer.launch_passive(m, d, show_left_ui=True, show_right_ui=True) as viewer:
+            # startup delay
+            wait_time = 5.0
+            wall_start_time = time.time()
+            print(f"Waiting {wait_time} seconds for you to arrange windows...")
+            
+            while viewer.is_running():
+                # start up delay
+                step_start = time.time()
+                if time.time() - wall_start_time < wait_time:
+                    viewer.sync()
+                    time.sleep(1/60.0)
+                    continue
+
+                # sample IMU (high freq sensors)
+                sensor_acc = accel.sample(d.sensordata[:3], physics_dt)
+                sensor_gyro = gyro.sample(d.sensordata[3:6], physics_dt)
+                sensor_mag = mag.sample(d.sensordata[6:9])
+                latest_sensor_gyro = sensor_gyro
+                gyro_accumulator.append(sensor_gyro.copy())  # Accumulate for MPC-period averaging
+
+                mekf.prediction(physics_dt, sensor_gyro.reshape(3, 1), sensor_acc.reshape(3, 1))
         
-        while viewer.is_running():
-            # start up delay
-            step_start = time.time()
-            if time.time() - wall_start_time < wait_time:
+                mj.mj_step(m, d)
+
+                # Propellant depletion: burn slosh mass according to physical engine thrust
+                if ENABLE_FUEL_DEPLETION and current_slosh_mass > MIN_SLOSH_MASS:
+                    actual_thrust = max(0.0, float(d.actuator_force[2]))
+                    dm = (actual_thrust / (ISP * G0)) * physics_dt
+                    current_slosh_mass = max(MIN_SLOSH_MASS, current_slosh_mass - dm)
+                    m.body_mass[slosh_body_id] = current_slosh_mass
+                    m.body_inertia[slosh_body_id, :] = sphere_inertia_factor * current_slosh_mass
+                    m.body_subtreemass[slosh_body_id] = current_slosh_mass
+                    m.body_subtreemass[slosh_dummy_id] = m.body_mass[slosh_dummy_id] + current_slosh_mass
+                    m.body_subtreemass[1] = np.sum(m.body_mass[1:])
+                    m.body_subtreemass[0] = m.body_subtreemass[1]
+
                 viewer.sync()
-                time.sleep(1/60.0)
-                continue
 
-            # sample IMU (high freq sensors)
-            sensor_acc = accel.sample(d.sensordata[:3], physics_dt)
-            sensor_gyro = gyro.sample(d.sensordata[3:6], physics_dt)
-            sensor_mag = mag.sample(d.sensordata[6:9])
-            latest_sensor_gyro = sensor_gyro
-            gyro_accumulator.append(sensor_gyro.copy())  # Accumulate for MPC-period averaging
+                if steps_to_gps >= steps_per_gps:
+                    gps_pos = gps.sample(np.array(d.qpos[0:3]).reshape(3, 1))
+                    mekf.correction(physics_dt * steps_to_gps, acc=sensor_acc.reshape(3, 1), mag=sensor_mag.reshape(3, 1), gps=gps_pos)
+                    steps_to_gps = 0
 
-            mekf.prediction(physics_dt, sensor_gyro.reshape(3, 1), sensor_acc.reshape(3, 1))
-    
-            mj.mj_step(m, d)
+                    if engine_cut:
+                        print(f"Final Position: ({mekf.pos})")
 
-            viewer.sync()
+                if steps_to_render >= steps_per_render:
+                    rr.set_time("sim_time", sequence=int(d.time/physics_dt))
 
-            if steps_to_gps >= steps_per_gps:
-                gps_pos = gps.sample(np.array(d.qpos[0:3]).reshape(3, 1))
-                mekf.correction(physics_dt * steps_to_gps, acc=sensor_acc.reshape(3, 1), mag=sensor_mag.reshape(3, 1), gps=gps_pos)
-                steps_to_gps = 0
+                    # Log clean vs estimated positions
+                    rr.log("position/x/true", rr.Scalars(mekf.pos[0]))
+                    rr.log("position/y/true", rr.Scalars(mekf.pos[1]))
+                    rr.log("position/z/true", rr.Scalars(mekf.pos[2]))
+                    
+                    # Log target positions
+                    if x_target is not None:
+                        rr.log("position/x/target", rr.Scalars(x_target[0]))
+                        rr.log("position/y/target", rr.Scalars(x_target[1]))
+                        rr.log("position/z/target", rr.Scalars(x_target[2]))
 
-                if engine_cut:
-                    print(f"Final Position: ({mekf.pos})")
+                    # Log clean vs estimated velocities
+                    rr.log("velocity/mekf_vx", rr.Scalars(mekf.vel[0]))
+                    rr.log("velocity/mekf_vy", rr.Scalars(mekf.vel[1]))
+                    rr.log("velocity/mekf_vz", rr.Scalars(mekf.vel[2]))
 
-            if steps_to_render >= steps_per_render:
-                rr.set_time("sim_time", sequence=int(d.time/physics_dt))
+                    # Convert to Euler angles only for telemetry logging / visualization
+                    euler_mekf = quat_to_euler(mekf.q)
+                    rr.log("attitude/roll", rr.Scalars(euler_mekf[0]))
+                    rr.log("attitude/pitch", rr.Scalars(euler_mekf[1]))
+                    rr.log("attitude/yaw", rr.Scalars(euler_mekf[2]))
 
-                # Log clean vs estimated positions
-                rr.log("position/x/true", rr.Scalars(mekf.pos[0]))
-                rr.log("position/y/true", rr.Scalars(mekf.pos[1]))
-                rr.log("position/z/true", rr.Scalars(mekf.pos[2]))
-                
-                # Log target positions
-                if x_target is not None:
-                    rr.log("position/x/target", rr.Scalars(x_target[0]))
-                    rr.log("position/y/target", rr.Scalars(x_target[1]))
-                    rr.log("position/z/target", rr.Scalars(x_target[2]))
+                    # Log controls
+                    rr.log("control/thrust", rr.Scalars(current_thrust))
+                    rr.log("control/gimbal_x", rr.Scalars(current_gimbal_x))
+                    rr.log("control/gimbal_y", rr.Scalars(current_gimbal_y))
 
-                # Log clean vs estimated velocities
-                rr.log("velocity/mekf_vx", rr.Scalars(mekf.vel[0]))
-                rr.log("velocity/mekf_vy", rr.Scalars(mekf.vel[1]))
-                rr.log("velocity/mekf_vz", rr.Scalars(mekf.vel[2]))
+                    # Log guidance optimal time-to-go
+                    rr.log("guidance/t_final", rr.Scalars(t_final_current))
 
-                # Convert to Euler angles only for telemetry logging / visualization
-                euler_mekf = quat_to_euler(mekf.q)
-                rr.log("attitude/roll", rr.Scalars(euler_mekf[0]))
-                rr.log("attitude/pitch", rr.Scalars(euler_mekf[1]))
-                rr.log("attitude/yaw", rr.Scalars(euler_mekf[2]))
+                    # Log mass telemetry
+                    total_mass = float(np.sum(m.body_mass))
+                    fuel_pct = ((current_slosh_mass - MIN_SLOSH_MASS) / max(1e-6, (initial_slosh_mass - MIN_SLOSH_MASS))) * 100.0
+                    rr.log("mass/total", rr.Scalars(total_mass))
+                    rr.log("mass/slosh_propellant", rr.Scalars(current_slosh_mass))
+                    rr.log("mass/fuel_percent", rr.Scalars(fuel_pct))
 
-                # Log controls
-                rr.log("control/thrust", rr.Scalars(current_thrust))
-                rr.log("control/gimbal_x", rr.Scalars(current_gimbal_x))
-                rr.log("control/gimbal_y", rr.Scalars(current_gimbal_y))
+                    steps_to_render = 0
 
-                # Log guidance optimal time-to-go
-                rr.log("guidance/t_final", rr.Scalars(t_final_current))
+                time_until_next_step = m.opt.timestep - (time.time() - step_start)
+                steps_to_render += 1
+                steps_to_gps += 1
+                if time_until_next_step > 0:
+                    time.sleep(time_until_next_step)
 
-                steps_to_render = 0
-
-            time_until_next_step = m.opt.timestep - (time.time() - step_start)
-            steps_to_render += 1
-            steps_to_gps += 1
-            if time_until_next_step > 0:
-                time.sleep(time_until_next_step)
-
-    # Clean shutdown of guidance worker process
-    if guidance_req_queue is not None:
+    except KeyboardInterrupt:
+        print("Simulation closed by user.")
+    finally:
+        mj.set_mjcb_control(None)
+        if guidance_req_queue is not None:
+            try:
+                guidance_req_queue.put_nowait(None)
+            except Exception:   
+                pass
+        if worker_process is not None and worker_process.is_alive():
+            worker_process.terminate()
         try:
-            guidance_req_queue.put(None)
+            rec = rr.get_global_data_recording()
+            if rec is not None:
+                rec.flush(timeout_sec=0.5)
+            rr.disconnect()
         except Exception:
             pass
-    if worker_process is not None and worker_process.is_alive():
-        worker_process.terminate()
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
