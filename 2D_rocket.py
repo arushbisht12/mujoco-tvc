@@ -33,6 +33,7 @@ steps_per_gps = int((1.0 / gps_frequency) / physics_dt)
 ENABLE_FUEL_DEPLETION = True
 ISP = 120.0             # Specific impulse in seconds (fuel burn rate: dm = F / (ISP * g0) * dt)
 MIN_SLOSH_MASS = 0.005  # Residual dry slosh floor (kg)
+MIN_FLUID_MASS = 0.005
 G0 = 9.81               # Standard gravity constant (m/s^2)
 
 def load_model():
@@ -429,13 +430,29 @@ def main():
     initialize_controller1(m, d)
     mj.set_mjcb_control(controller1)
 
-    # Slosh mass identification and setup for propellant depletion
+    # Slosh and vehicle body setup for propellant depletion
+    rocket_body_id = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "rocket")
     slosh_body_id = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "slosh_mass_xy")
     slosh_dummy_id = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "slosh_dummy_x")
+    gimbal_pitch_id = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "gimbal_pitch")
+    gimbal_yaw_id = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "gimbal_yaw")
+
+    initial_total_mass = float(np.sum(m.body_mass))
     initial_slosh_mass = float(m.body_mass[slosh_body_id])
+    initial_fluid_mass = 0.8 * initial_total_mass
+    initial_solid_mass = 0.2 * initial_total_mass
+    current_fluid_mass = initial_fluid_mass
     current_slosh_mass = initial_slosh_mass
-    # Precomputed sphere inertia factor: I = 2/5 * m * r^2 = 0.4 * (0.08^2) * m = 0.00256 * m
-    sphere_inertia_factor = 0.4 * (0.08 ** 2)
+    initial_tank_level = 0.2
+    tank_radius = 0.08
+    # Precomputed sphere inertia factor: I = 2/5 * m * r^2 (sphere geom radius is 0.08 m)
+    sphere_geom_id = m.body_geomadr[slosh_body_id]
+    sphere_radius = float(m.geom_size[sphere_geom_id, 0]) if sphere_geom_id >= 0 else 0.08
+    sphere_inertia_factor = 0.4 * (sphere_radius ** 2)
+
+    other_bodies_mass = float(
+        m.body_mass[slosh_dummy_id] + m.body_mass[gimbal_pitch_id] + m.body_mass[gimbal_yaw_id]
+    )
 
     # Rerun blueprint (3-column layout including mass telemetry)
     common_x = rrb.TimeAxis(
@@ -459,7 +476,8 @@ def main():
             ),
             rrb.Vertical(
                 rrb.TimeSeriesView(name="Total Mass (kg)", origin="mass/total", axis_x=common_x, axis_y=rrb.ScalarAxis(range=(0.6, 1.1))),
-                rrb.TimeSeriesView(name="Slosh Propellant (kg)", origin="mass/slosh_propellant", axis_x=common_x, axis_y=rrb.ScalarAxis(range=(0.0, 0.25))),
+                rrb.TimeSeriesView(name="Fluid Propellant (kg)", origin="mass/fluid_propellant", axis_x=common_x, axis_y=rrb.ScalarAxis(range=(0.0, 1.0))),
+                rrb.TimeSeriesView(name="Slosh Propellant (kg)", origin="mass/slosh_propellant", axis_x=common_x, axis_y=rrb.ScalarAxis(range=(0.0, 0.3))),
                 rrb.TimeSeriesView(name="Optimal Time-To-Go", origin="guidance/t_final", axis_x=common_x)
             )
         )
@@ -495,13 +513,32 @@ def main():
         
                 mj.mj_step(m, d)
 
-                # Propellant depletion: burn slosh mass according to physical engine thrust
-                if ENABLE_FUEL_DEPLETION and current_slosh_mass > MIN_SLOSH_MASS:
+                # Propellant depletion: burn fluid mass according to physical engine thrust
+                if ENABLE_FUEL_DEPLETION and current_fluid_mass > MIN_FLUID_MASS:
                     actual_thrust = max(0.0, float(d.actuator_force[2]))
                     dm = (actual_thrust / (ISP * G0)) * physics_dt
-                    current_slosh_mass = max(MIN_SLOSH_MASS, current_slosh_mass - dm)
+                    current_fluid_mass = max(MIN_FLUID_MASS, current_fluid_mass - dm)
+                    current_total_mass = initial_solid_mass + current_fluid_mass
+
+                    h = max(1e-4, (current_fluid_mass / initial_fluid_mass) * initial_tank_level)
+                    current_slosh_mass = max(
+                        MIN_SLOSH_MASS,
+                        (0.4545 * (tank_radius / h) * np.tanh(1.8412 * h / tank_radius)) * current_fluid_mass
+                    )
+                    current_rigid_mass = current_total_mass - current_slosh_mass
+                    current_rocket_mass = max(0.01, current_rigid_mass - other_bodies_mass)
+
+                    # 1. Update slosh mass sphere body
                     m.body_mass[slosh_body_id] = current_slosh_mass
                     m.body_inertia[slosh_body_id, :] = sphere_inertia_factor * current_slosh_mass
+
+                    # 2. Update rocket cylinder body (structure + static fluid)
+                    m.body_mass[rocket_body_id] = current_rocket_mass
+                    m.body_inertia[rocket_body_id, 0] = (1.03 / 12.0) * current_rocket_mass
+                    m.body_inertia[rocket_body_id, 1] = (1.03 / 12.0) * current_rocket_mass
+                    m.body_inertia[rocket_body_id, 2] = 0.005 * current_rocket_mass
+
+                    # 3. Update kinematic subtree masses so MuJoCo's center-of-mass kinematics stay exact
                     m.body_subtreemass[slosh_body_id] = current_slosh_mass
                     m.body_subtreemass[slosh_dummy_id] = m.body_mass[slosh_dummy_id] + current_slosh_mass
                     m.body_subtreemass[1] = np.sum(m.body_mass[1:])
@@ -552,9 +589,11 @@ def main():
 
                     # Log mass telemetry
                     total_mass = float(np.sum(m.body_mass))
-                    fuel_pct = ((current_slosh_mass - MIN_SLOSH_MASS) / max(1e-6, (initial_slosh_mass - MIN_SLOSH_MASS))) * 100.0
+                    fuel_pct = ((current_fluid_mass - MIN_FLUID_MASS) / max(1e-6, (initial_fluid_mass - MIN_FLUID_MASS))) * 100.0
                     rr.log("mass/total", rr.Scalars(total_mass))
+                    rr.log("mass/fluid_propellant", rr.Scalars(current_fluid_mass))
                     rr.log("mass/slosh_propellant", rr.Scalars(current_slosh_mass))
+                    rr.log("mass/rigid_cylinder", rr.Scalars(m.body_mass[rocket_body_id]))
                     rr.log("mass/fuel_percent", rr.Scalars(fuel_pct))
 
                     steps_to_render = 0
