@@ -120,7 +120,9 @@ def initialize_controller1(m, d):
         "beta": 1.0,
         "gamma": 1.0,
         "ground_clearance": ground_clearance,
-        "mass": total_mass
+        "mass": total_mass,
+        "dry_mass": 0.20 * total_mass + 0.005,
+        "isp": ISP
     }
     worker_process = mp.Process(
         target=guidance_worker_loop,
@@ -219,8 +221,8 @@ def controller1(m, d):
     if (d.time - last_guidance_time >= 0.5) and not guidance_is_busy and t_final_current > 3.0:
         t_elapsed = d.time - last_guidance_time
         try:
-            # Open-loop step: send x_init=None so planner samples from previous trajectory with current mass
-            guidance_req_queue.put_nowait((d.time, None, x_land, t_elapsed, current_total_mass))
+            # Open-loop step: send x_init=None so planner samples state and mass from previous trajectory
+            guidance_req_queue.put_nowait((d.time, None, x_land, t_elapsed))
             guidance_is_busy = True
             last_guidance_time = d.time
         except mp.queues.Full:
