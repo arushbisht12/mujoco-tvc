@@ -200,8 +200,8 @@ class MPCPlanner:
             # Velocity-altitude glide slope (forces slower descent near the ground)
             self.opti.subject_to(self.X[5, k] >= -0.6 * (self.X[2, k] - self.ground_clearance) - 0.2)
             eps = 1e-6
-            self.opti.subject_to(ca.sqrt(self.X[4, k]**2 + eps) <= 0.2 * self.X[1, k] + 0.1)
-            self.opti.subject_to(ca.sqrt(self.X[3, k]**2 + eps) <= 0.2 * self.X[0, k] + 0.1)
+            self.opti.subject_to(ca.sqrt(self.X[4, k]**2 + eps) <= 0.2 * self.X[2, k] + 0.1)
+            self.opti.subject_to(ca.sqrt(self.X[3, k]**2 + eps) <= 0.2 * self.X[2, k] + 0.1)
             
             # Approach Cone Constraint (optional, with soft slack in squared form)
             if self.approach_cone_deg is not None:
@@ -249,11 +249,11 @@ class MPCPlanner:
         p_opts = {"expand": True, "print_time": False}
         s_opts = {
             "max_iter": 200,
-            "tol": 1e-3,
+            "tol": 1e-1,
             "dual_inf_tol": 1e-2,
-            "constr_viol_tol": 1e-3,
-            "compl_inf_tol": 1e-3,
-            "acceptable_tol": 1e-2,
+            "constr_viol_tol": 1e-1,
+            "compl_inf_tol": 1e-1,
+            "acceptable_tol": 1e-1,
             "acceptable_iter": 5,
             "warm_start_init_point": "yes",
             "warm_start_bound_push": 1e-4,

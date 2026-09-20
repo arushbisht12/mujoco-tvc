@@ -400,8 +400,8 @@ def main():
     q0 = np.array(d.qpos[3:7]).reshape(4, 1) # [w, x, y, z]
 
     # Covariances for MEKF (gyro, accel, gyro_bias, accel_bias)
-    gyro_cov = 0.05
-    accel_cov = 0.1
+    gyro_cov = 0.01
+    accel_cov = 0.01
     gyro_bias_cov = 0.001
     accel_bias_cov = 0.001
 
